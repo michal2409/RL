@@ -1,0 +1,160 @@
+# GRPO config for DeepSeek V4 Flash-Base — Megatron-Bridge path
+# Fine-tunes the pretrained Flash-Base checkpoint via GRPO (cold-start RL).
+# Mirrors grpo_dsv4_base_bf16_4k_automodel_8n_ep64.yaml for the Megatron backend.
+#
+# Cluster layout (GB300, 8 GPUs/node, non-colocated):
+#   - 16 total nodes × 8 GPUs = 128 GPUs
+#   - 8 nodes (64 GPUs) for training (Megatron, EP=4)
+#   - 8 nodes (64 GPUs) for vLLM rollout (TP=4, 16 replicas)
+#
+# Depends on:
+#   - NeMo-RL PR #2460 (deepseek_v4 chat template + vLLM Base FP8 patches)
+#   - Megatron-Bridge PR #3562 (V4 converter; bridge handles Base FP8 import)
+#
+# Launcher requirements (Flash-Base specifically):
+#   1. Apply the vLLM Base FP8 monkey-patch BEFORE launching:
+#        bash tools/patch_vllm_dsv4_base_fp8_quick.sh
+#   2. Export these env vars (Ray propagates them to all workers):
+#        export VLLM_DSV4_BASE_FP8=1   # routes experts via Fp8MoEMethod
+#        export NRL_SWIGLU_LIMIT=10    # clamp Base SwiGLU outputs
+defaults: grpo_math_1B_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  batch_multiplier: 1
+  max_rollout_turns: 1
+  max_num_steps: 20
+  use_leave_one_out_baseline: false
+  val_period: 5
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 2048
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  keep_top_k: 1
+  save_period: 10
+  model_save_format: null
+  checkpoint_dir: results/grpo-dsv4-base-bf16-4k-megatron-8n-ep4
+
+policy:
+  model_name: deepseek-ai/DeepSeek-V4-Flash-Base
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: bfloat16
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 64
+  max_grad_norm: 1.0
+  # Non-colocated path: optimizer can offload during logprob since training
+  # GPUs are not shared with vLLM.
+  offload_optimizer_for_logprob: true
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    converter_type: DeepseekV4ForCausalLM
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_token_dispatcher_type: flex
+    moe_enable_deepep: true
+    moe_grouped_gemm: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    mtp_num_layers: 0
+    activation_checkpointing: true
+    gradient_accumulation_fusion: false
+
+    optimizer:
+      lr: 2.0e-7
+      min_lr: 2.0e-8
+      weight_decay: 0.0
+      use_precision_aware_optimizer: true
+
+    scheduler:
+      lr_warmup_iters: 5
+      lr_warmup_init: 2.0e-8
+
+    fp8_cfg:
+      enabled: false
+
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+
+  dynamic_batching:
+    enabled: false
+
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.3
+      precision: fp8
+      kv_cache_dtype: fp8_ds_mla
+      use_deep_gemm: true
+      enforce_eager: true
+      async_engine: true
+      max_model_len: ${policy.max_total_sequence_length}
+    vllm_kwargs:
+      tokenizer_mode: deepseek_v4
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+# Logger: inherit parent's all-disabled defaults
+# (wandb_enabled, tensorboard_enabled, mlflow_enabled, swanlab_enabled all false
+# in grpo_math_1B_megatron.yaml). Override here if you want to turn any on.
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
