@@ -1,0 +1,44 @@
+# Longer GRPO run for DeepSeek-V4-Flash-Base on a single node, intended
+# to exercise the optimizer/scheduler over many steps and produce a
+# loss/reward/length time series. Inherits the tiny smoke-test recipe
+# and only changes the pieces that affect what we want to observe:
+#   * max_num_steps lifted from 3 -> 100
+#   * max_new_tokens lowered from 512 -> 128 (faster + every response
+#     stays under the overlong-shaping window, so reward variance is
+#     driven by task verification only, not length)
+#   * LR bumped 5x (2e-7 -> 1e-6) with a longer warmup so the schedule
+#     actually traverses something interesting
+#   * tensorboard enabled (curves end up under logger.log_dir)
+#   * force_reconvert_from_hf disabled so the cached mcore checkpoint
+#     from the smoke-test run is reused (saves ~3min of bootstrap)
+#
+# Reality check on what "learning" can mean here: this is a 4-layer
+# truncation of a 61-layer pretrained model, so internal layers are
+# essentially random. The point of this run is to verify the GRPO
+# loop stays stable over many steps and to capture metric trends if
+# any signal does emerge from reward variance.
+defaults: grpo_dsv4_base_tiny_1n_megatron.yaml
+
+grpo:
+  max_num_steps: 100
+  val_period: 100  # disabled: equal to max_num_steps so val never fires
+
+policy:
+  max_total_sequence_length: 1024  # = max_input_seq_length + max_new_tokens
+  generation:
+    max_new_tokens: 128
+
+  megatron_cfg:
+    force_reconvert_from_hf: false
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-8
+
+logger:
+  # exp folder under log_dir + tensorboard subdir created automatically
+  log_dir: /results/logs/grpo-dsv4-long-1n
+  tensorboard_enabled: true
+  tensorboard: {}
