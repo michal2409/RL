@@ -982,13 +982,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
             else:
-                # Calculate size for this parameter
+                # Floating-point params are cast to the policy training dtype on
+                # refit; integer buffers (e.g. DSv4 hash-MoE tid2eid) keep their
+                # own dtype, so the scale stays at 1.
                 prec_to_bytes = {
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
                 }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                if param.dtype.is_floating_point:
+                    scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                else:
+                    scale = 1
                 size_in_bytes = (
                     param.element_size() * param.numel() * tp_size * ep_size * scale
                 )

@@ -1,0 +1,187 @@
+# Tiny GRPO smoke-test config for DeepSeek-V4-Flash-Base on a single node
+# (8 x H100 80GB). Goal: a few-step functional verification of the GRPO
+# Megatron pipeline on this checkpoint. Mirrors the 8-node Megatron recipe
+# but trades scale for memory: colocated vLLM + maximum offload + smallest
+# possible batch sizes.
+#
+# Same launcher requirements as the full recipe:
+#   1. Apply the vLLM Base FP8 monkey-patch BEFORE launching:
+#        bash tools/patch_vllm_dsv4_base_fp8_quick.sh
+#   2. Export these env vars (Ray propagates them to all workers):
+#        export VLLM_DSV4_BASE_FP8=1
+#        export NRL_SWIGLU_LIMIT=10
+#   3. NRL_DSV4_DISABLE_FUSED_MHC=1 is set in policy.megatron_cfg.env_vars
+#      below (Ray propagates it to the megatron workers). The fused mHC
+#      proj-RMS path uses cuTile, which rejects launches on CUDA driver
+#      < 13.0; with this flag set, community_import.py falls back to the
+#      native (unfused) implementation. Switch to "0" once you upgrade
+#      to driver >= 13.0.
+defaults: grpo_math_1B_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  batch_multiplier: 1
+  max_rollout_turns: 1
+  max_num_steps: 3
+  use_leave_one_out_baseline: false
+  val_period: 100
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 8
+  val_batch_size: 8
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    max_response_length: 512
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  enabled: false
+  keep_top_k: 1
+  save_period: 1000
+  model_save_format: null
+  checkpoint_dir: /results/grpo-dsv4-tiny-1n
+
+policy:
+  # Local tiny copy of DeepSeek-V4-Flash-Base: same architecture, but
+  # num_hidden_layers=4 and num_nextn_predict_layers=0 so the full model can
+  # fit on 8 GPUs. Built from the HF cache via symlinks (see progress.txt).
+  model_name: /results/dsv4-tiny
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: bfloat16
+  max_total_sequence_length: 1536
+  make_sequence_length_divisible_by: 64
+  max_grad_norm: 1.0
+  # Colocated vLLM + heavy offload: keep optimizer on CPU at all times.
+  optimizer_cpu_offload: true
+  optimizer_offload_fraction: 1.0
+  offload_optimizer_for_logprob: true
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    converter_type: DeepseekV4ForCausalLM
+    # All 8 GPUs do EP across the 256 routed experts (32 experts/rank).
+    # TP=1 so non-expert weights are replicated; that's 17 GB BF16 per rank.
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: false
+    moe_token_dispatcher_type: flex
+    moe_enable_deepep: true
+    moe_grouped_gemm: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    mtp_num_layers: 0
+    activation_checkpointing: true
+    gradient_accumulation_fusion: false
+    empty_unused_memory_level: 2
+
+    optimizer:
+      lr: 2.0e-7
+      min_lr: 2.0e-8
+      weight_decay: 0.0
+      use_precision_aware_optimizer: true
+
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 2.0e-8
+
+    fp8_cfg:
+      enabled: false
+
+    # Force a fresh HF -> mcore conversion because we trimmed the HF config
+    # (num_hidden_layers, compress_ratios). Any prior cached run_config would
+    # not match.
+    force_reconvert_from_hf: true
+
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # On hosts with CUDA driver < 13.0, the fused mHC proj-RMS path
+      # (cuTile) rejects launches. Setting this routes through the
+      # native unfused implementation. Safe to leave on; with newer
+      # drivers, switch to "0" to use the fused path.
+      NRL_DSV4_DISABLE_FUSED_MHC: "1"
+
+  # DSv4 uses DeepSeek Sparse Attention (CompressedSparseAttention); that
+  # path asserts `packed_seq_params is None` (csa.py:661), so packed
+  # sequences are not supported. Disable sequence packing for DSv4.
+  sequence_packing:
+    enabled: false
+    fuse_loss: true
+
+  dynamic_batching:
+    enabled: false
+
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.55
+      precision: fp8
+      kv_cache_dtype: fp8_ds_mla
+      use_deep_gemm: true
+      enforce_eager: true
+      async_engine: false
+      max_model_len: ${policy.max_total_sequence_length}
+    vllm_kwargs:
+      tokenizer_mode: deepseek_v4
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+
+env:
+  math:
+    num_workers: 8
+    math_verify_impl: dapo_math_verify
+
+logger:
+  log_dir: /results/logs/grpo-dsv4-tiny-1n
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
