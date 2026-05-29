@@ -946,13 +946,21 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        # The streaming iterator below does a per-expert EP all_gather inside
+        # megatron-bridge. On large MoE models (DSv4) at 80 GiB / GPU, NCCL
+        # can fail to allocate even small scratch buffers without first
+        # returning reserved pages and dropping pinned Python references.
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
-        # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+            del tensor
+            torch.cuda.empty_cache()
 
         return refit_param_info_hf
 

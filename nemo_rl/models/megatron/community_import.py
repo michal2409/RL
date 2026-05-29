@@ -92,6 +92,11 @@ def import_model_from_hf_name(
         model_provider.pipeline_model_parallel_size = megatron_config[
             "pipeline_model_parallel_size"
         ]
+        # Optional explicit PP layout; required by Megatron-LM when using
+        # hash-MoE with PP>1 (e.g. DSv4). None falls back to block-balanced.
+        layout = megatron_config.get("pipeline_model_parallel_layout")
+        if layout is not None:
+            model_provider.pipeline_model_parallel_layout = layout
         model_provider.context_parallel_size = megatron_config["context_parallel_size"]
         model_provider.expert_model_parallel_size = megatron_config[
             "expert_model_parallel_size"
