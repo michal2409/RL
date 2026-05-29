@@ -33,24 +33,34 @@ class StatelessProcessGroup:
         )
 
     def init_nccl_communicator(self, device: int):
-        UNIQUE_ID_KEY = "nccl_unique_id"
+        # Use multiple UniqueIds to fan out the NCCL scalable bootstrap.
+        # The Python nccl wrapper hardcodes nbufs=1 when given a single
+        # UniqueId; passing a Sequence routes to the multi-id path so
+        # ncclCommInitRankScalable can use multiple "broadcast roots" in
+        # parallel, which avoids a single-root bottleneck on large
+        # communicators. Heuristic: 1 root per 32 ranks, minimum 1.
+        num_unique_ids = max(1, self.world_size // 32)
 
         if self.rank == 0:
-            unique_id = get_unique_id()
-            unique_id_bytes = unique_id.as_bytes
-            # Rank 0: store unique_id to TCPStore
-            self.tcp_store.set(UNIQUE_ID_KEY, unique_id_bytes)
+            unique_ids = [get_unique_id() for _ in range(num_unique_ids)]
+            for i, uid in enumerate(unique_ids):
+                self.tcp_store.set(f"nccl_unique_id_{i}", uid.as_bytes)
         else:
-            # Other ranks: get unique_id from TCPStore
-            self.tcp_store.wait([UNIQUE_ID_KEY])
-            unique_id_bytes = self.tcp_store.get(UNIQUE_ID_KEY)
-            unique_id = UniqueId.from_bytes(unique_id_bytes)
+            unique_ids = []
+            for i in range(num_unique_ids):
+                self.tcp_store.wait([f"nccl_unique_id_{i}"])
+                uid_bytes = self.tcp_store.get(f"nccl_unique_id_{i}")
+                unique_ids.append(UniqueId.from_bytes(uid_bytes))
 
         with torch.cuda.device(device):
+            # When num_unique_ids == 1 pass the single UniqueId object so
+            # the wrapper takes its original code path; otherwise pass the
+            # list to route to ncclCommInitRankScalable with nbufs=len(list).
+            unique_id_arg = unique_ids[0] if num_unique_ids == 1 else unique_ids
             self.nccl_communicator = Communicator.init(
                 nranks=self.world_size,
                 rank=self.rank,
-                unique_id=unique_id,
+                unique_id=unique_id_arg,
             )
             # warmup and check if broadcast is working
             stream = torch.cuda.current_stream()

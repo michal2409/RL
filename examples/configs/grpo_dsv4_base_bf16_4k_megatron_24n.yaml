@@ -1,31 +1,28 @@
-# GRPO config for DeepSeek-V4-Flash-Base — full-scale, H100 80GB SXM,
+# GRPO config for DeepSeek-V4-Flash-Base — multi-node, H100 80GB SXM,
 # non-colocated layout (vLLM rollout separate from Megatron training).
 #
-# Cluster layout: 24 nodes × 8 H100 80GB GPUs = 192 GPUs
-#   - 16 train nodes (128 GPUs): Megatron-Bridge, EP=8, PP=2, TP=1
-#   - 8  inference nodes (64 GPUs): vLLM, TP=4 → 16 replicas
+# Default cluster layout (24 nodes × 8 H100 = 192 GPUs):
+#   - 16 train nodes (128 GPUs): Megatron-Bridge, PP=8, EP=8, TP=1 → DP=16
+#   -  8 inference nodes (64 GPUs): vLLM, TP=8 → 8 replicas
 #
-# Sizing rationale (for tuning to a different cluster):
+# Override `++cluster.num_nodes` from the launcher to scale up; keep
+# `generation.colocated.resources.num_nodes=8` and add the extra nodes to
+# the train side. Each train-side parallelism axis must continue to
+# divide the new world size, and `grpo.num_prompts_per_step` must remain
+# divisible by both the new DP count and the vLLM replica count (see
+# notes below).
+#
+# Sizing rationale:
 #   - Full model is ~671B params (61 layers, 256 MoE experts/layer).
 #   - GB300 (144 GB/GPU) needed 16 nodes (8 train EP=4 + 8 inf TP=4); see
 #     grpo_dsv4_base_bf16_4k_megatron_8n_ep4.yaml.
-#   - H100 80GB has ~55% of the GB300 memory budget. To compensate this
-#     config doubles EP (4→8) and adds PP=2, which together fit non-expert
-#     weights + activations + optimizer-CPU-offload comfortably under 80GB.
-#   - Per-rank load (training): experts ~1.6GB, dense ~2GB, activations
-#     gated by activation_checkpointing=true, optimizer fully CPU-offloaded.
-#
-# To scale node count:
-#   * 32 nodes (16 train + 16 inf): same EP=8/PP=2 but more vLLM replicas
-#     for throughput. Set generation.colocated.resources.num_nodes=16.
-#   * 16 nodes (12 train + 4 inf): drop PP back to 1, keep EP=8 (12*8/8=12
-#     EP groups). Tighter; expect more activation recompute pressure.
-#   * 48 nodes: typically more inference replicas, train side stays as-is.
-#   Always: cluster.num_nodes = train_nodes + colocated.resources.num_nodes.
+#   - H100 80GB has ~55% of the GB300 memory budget. We double EP (4→8)
+#     and add PP=8, which together fit non-expert weights + activations
+#     + optimizer-CPU-offload comfortably under 80GB per train rank.
 #
 # Depends on (same as the 8n_ep4 recipe):
 #   - NeMo-RL: deepseek_v4 chat template + vLLM Base FP8 patches
-#   - Megatron-Bridge: V4 converter (PR #3562 / current branch)
+#   - Megatron-Bridge: V4 converter
 #
 # Launcher requirements (Flash-Base specific):
 #   1. Apply the vLLM Base FP8 monkey-patch on every node BEFORE launching:
@@ -33,12 +30,22 @@
 #   2. The env vars below are propagated to every Ray worker:
 #        VLLM_DSV4_BASE_FP8=1      # routes experts via Fp8MoEMethod
 #        NRL_SWIGLU_LIMIT=10       # clamp Base SwiGLU outputs
-#   3. On hosts with CUDA driver < 13.0, also set:
-#        NRL_DSV4_DISABLE_FUSED_MHC=1  (set in policy.megatron_cfg.env_vars below)
+#   3. On hosts with CUDA driver < 13.0, also set
+#        NRL_DSV4_DISABLE_FUSED_MHC=1  (set in megatron_cfg.env_vars below)
+#   4. With vLLM at high GMU, cap the refit chunk buffer via
+#        NRL_REFIT_BUFFER_MEMORY_RATIO=0.005
+#      so it fits in the headroom left by KV cache + private NCCL pools.
 defaults: grpo_dsv4_base_bf16_4k_megatron_8n_ep4.yaml
 
 grpo:
-  num_prompts_per_step: 64
+  # num_prompts_per_step * num_generations_per_prompt = training batch size.
+  # Must divide BOTH the train DP shard count (world_size / (TP * PP)) AND
+  # the vLLM replica count (inf_world_size / vLLM TP). For the default
+  # layout (DP=16, vLLM replicas=8) the LCM is 16, so multiples of 16/8=2
+  # for num_prompts work; at NUM_NODES=32 (DP=24, replicas=8) the LCM is
+  # 24, so use multiples of 24/8=3. 48 is the smallest count that works
+  # for both 24- and 32-node launches.
+  num_prompts_per_step: 48
   num_generations_per_prompt: 8
   max_num_steps: 1000
   val_period: 50
@@ -57,20 +64,46 @@ checkpointing:
   checkpoint_dir: results/grpo-dsv4-base-bf16-4k-megatron-24n
 
 policy:
-  train_global_batch_size: 512
+  # Equal to num_prompts_per_step * num_generations_per_prompt above so
+  # the whole GRPO batch is one minibatch on the train side.
+  train_global_batch_size: 384
   train_micro_batch_size: 1
   logprob_batch_size: 1
 
+  # DSv4 uses DeepSeek-Sparse-Attention (CSA), which asserts on packed
+  # sequences (csa.py:661 asserts packed_seq_params is None). The 8n_ep4
+  # base config inherits sequence_packing.enabled=true; override to false
+  # here. Throughput cost is real but unavoidable until upstream CSA
+  # learns packed seqs.
+  sequence_packing:
+    enabled: false
+
   megatron_cfg:
-    # Doubled EP from the GB300 recipe (4 → 8) and added PP=2; together
-    # this halves dense-weight residency per rank and spreads experts
-    # twice as wide, recouping the ~45% memory headroom we lose moving
-    # from GB300 144GB to H100 80GB.
     tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 2
+    pipeline_model_parallel_size: 8
+    # DSv4-Flash-Base has 43 decoder layers + 1 MTP layer + 3 hash-MoE
+    # layers. Megatron-LM requires an explicit PP layout when PP>1 because
+    # the hash layers must all live on PP stage 0 with the embedding.
+    # Layout: stage 0 has the embedding + 6 decoders (incl. the 3 hash
+    # layers); stages 1-2 hold 6 decoders each; stages 3-7 hold 5 each;
+    # stage 7 also holds the MTP layer and the LM head.
+    pipeline_model_parallel_layout: "Et*6|t*6|t*6|t*5|t*5|t*5|t*5|t*5,m,L"
+    # DSv4-Flash-Base has num_nextn_predict_layers=1 in HF; csa_compress_ratios
+    # is populated for 43+1=44 layers, so mtp_num_layers must match (1, not
+    # the inherited 0 from the tiny-config base).
+    mtp_num_layers: 1
     context_parallel_size: 1
     expert_tensor_parallel_size: 1
+    # With PP=8 and TP=1, EP=8 gives 256 experts / 8 = 32 experts per rank
+    # and lets TP*PP*EP=64 divide the train world cleanly at every
+    # supported node count.
     expert_model_parallel_size: 8
+    # The Megatron-Bridge default for DSv4 (`flex` dispatcher with DeepEP)
+    # hangs deterministically inside the first refit's PP-group broadcast
+    # at this scale. The plain `flex` path (DeepEP off, grouped_gemm at
+    # its default of true) progresses cleanly.
+    moe_token_dispatcher_type: "flex"
+    moe_enable_deepep: false
     sequence_parallel: true
     activation_checkpointing: true
 
@@ -85,7 +118,7 @@ policy:
       lr_warmup_init: 2.0e-8
 
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       # Driver < 13.0: keep "1". Driver >= 13.0: set to "0" to use the
       # fused mHC proj-RMS kernel (cuTile).
       NRL_DSV4_DISABLE_FUSED_MHC: "1"
@@ -93,8 +126,15 @@ policy:
   generation:
     max_new_tokens: 2048
     vllm_cfg:
-      tensor_parallel_size: 4
-      gpu_memory_utilization: 0.85  # non-colocated → vLLM owns its GPUs
+      # Each vLLM replica spans a full 8-GPU node. The DSv4 FP8 model
+      # plus KV cache plus the refit chunk buffer does not fit at TP=4
+      # on 80 GiB; TP=8 roughly halves per-GPU model memory and leaves
+      # the headroom the refit broadcast needs.
+      tensor_parallel_size: 8
+      # 0.88 is the highest GMU that leaves enough free memory for the
+      # refit chunk buffer (capped via NRL_REFIT_BUFFER_MEMORY_RATIO in
+      # the launcher) on top of model + KV cache + private NCCL pools.
+      gpu_memory_utilization: 0.88
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
       use_deep_gemm: true
@@ -107,7 +147,7 @@ policy:
       enabled: false
       resources:
         gpus_per_node: 8
-        num_nodes: 8  # vLLM gets 8 of the 24 nodes (64 GPUs / TP=4 = 16 replicas)
+        num_nodes: 8
 
 logger:
   log_dir: results/grpo-dsv4-base-bf16-4k-megatron-24n
@@ -117,4 +157,6 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 24  # = train_nodes (16) + colocated.resources.num_nodes (8)
+  # Default 24 (16 train + 8 inference). Override via launcher
+  # `++cluster.num_nodes=N` to scale up; see header for the math.
+  num_nodes: 24

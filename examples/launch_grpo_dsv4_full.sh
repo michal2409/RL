@@ -43,9 +43,18 @@ cd "$REPO_LOCATION"
 : "${MOUNTS:?Set MOUNTS (srun --container-mounts list).}"
 : "${HF_TOKEN:?Set HF_TOKEN (for tokenizer / dataset).}"
 
+# ray.sub passes --container-workdir=$SLURM_SUBMIT_DIR (the repo root). On this
+# cluster, /lustre/fs1 is not always propagated into pyxis containers — some
+# allocations get nodes where it is, some don't. Bind-mount the repo path so
+# pyxis can always chdir into it.
+if [[ ",$MOUNTS," != *",$REPO_LOCATION:$REPO_LOCATION,"* ]]; then
+  MOUNTS="$MOUNTS,$REPO_LOCATION:$REPO_LOCATION"
+fi
+
+
 CONFIG=${CONFIG:-examples/configs/grpo_dsv4_base_bf16_4k_megatron_24n.yaml}
 NUM_NODES=${NUM_NODES:-24}
-WALL_TIME=${WALL_TIME:-12:00:00}
+WALL_TIME=${WALL_TIME:-2:00:00}
 WANDB_API_KEY=${WANDB_API_KEY:-}
 HF_HOME=${HF_HOME:-$REPO_LOCATION/.cache/hf}
 EXTRA_HYDRA_ARGS=${EXTRA_HYDRA_ARGS:-}
@@ -71,15 +80,22 @@ export HF_TOKEN=$HF_TOKEN
 export WANDB_API_KEY=${WANDB_API_KEY}
 export VLLM_DSV4_BASE_FP8=1
 export NRL_SWIGLU_LIMIT=10
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+# Cap the per-chunk refit buffer (default 0.02 = ~1.6 GiB on an 80 GiB H100).
+# At high vLLM GMU the default chunk size does not fit in the headroom left
+# by model + KV cache + private NCCL pools. Smaller chunks just mean more
+# broadcasts; correctness is unaffected.
+export NRL_REFIT_BUFFER_MEMORY_RATIO=0.005
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The cross-cluster model_update_group joins all train + inference workers
+# at once. The default 120 s bootstrap timeout is tight at hundreds of
+# ranks that each just finished loading model weights from lustre.
+export NCCL_BOOTSTRAP_TIMEOUT=600
 
 uv run --no-sync python examples/run_grpo.py \\
     --config $CONFIG \\
     ++cluster.num_nodes=$NUM_NODES \\
     ++logger.log_dir=results/$EXP_NAME \\
-    ++checkpointing.checkpoint_dir=results/$EXP_NAME/ckpt \\
-    $WANDB_OVERRIDES \\
-    $EXTRA_HYDRA_ARGS
+    ++checkpointing.checkpoint_dir=results/$EXP_NAME/ckpt $WANDB_OVERRIDES $EXTRA_HYDRA_ARGS
 EOF
 
 echo "=========================================================="
@@ -94,6 +110,11 @@ echo "  WALL_TIME   : $WALL_TIME"
 echo "  WANDB       : $([[ -n $WANDB_API_KEY ]] && echo "enabled" || echo "disabled")"
 echo "=========================================================="
 
+SBATCH_EXCLUDE_ARG=""
+if [[ -n "${EXCLUDE_NODES:-}" ]]; then
+  SBATCH_EXCLUDE_ARG="--exclude=$EXCLUDE_NODES"
+fi
+
 COMMAND="$COMMAND" \
 CONTAINER="$CONTAINER" \
 MOUNTS="$MOUNTS" \
@@ -104,4 +125,5 @@ sbatch \
     --time="$WALL_TIME" \
     --job-name="$EXP_NAME" \
     --gres=gpu:8 \
+    $SBATCH_EXCLUDE_ARG \
     ray.sub
