@@ -88,9 +88,17 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.models.policy.workers.patches import (
+    apply_torch_config_pickle_patch,
+    apply_transformer_engine_patch,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+# Applied at import time (before Ray serializes this worker's actor class) so that
+# torch>=2.11 config modules are picklable by reference. Required for the Megatron
+# path on the DSv4/vLLM-0.21 (torch 2.11) stack; see patches for details.
+apply_torch_config_pickle_patch()
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 

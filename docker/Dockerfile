@@ -120,9 +120,6 @@ COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
-COPY --from=vllm-wheel \
-     vllm-0.19.2rc1.dev219+gc0879d948.cu129-cp313-cp313-linux_x86_64.whl \
-     /home/mfutrega/vllm-0.19.2rc1.dev219+gc0879d948.cu129-cp313-cp313-linux_x86_64.whl
 
 RUN --mount=type=ssh <<"EOF" bash -exu
 uv venv --seed
@@ -207,12 +204,6 @@ if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-fi
-EOF
-
-RUN <<"EOF" bash -exu
-if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    bash /opt/nemo-rl/tools/patch_vllm_dsv4_base_fp8_quick.sh
 fi
 EOF
 
