@@ -151,6 +151,18 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
+            # The cross-cluster model_update_group spans nodes; NVLink SHARP (NVLS)
+            # cannot init across nodes and throws ncclUnhandledCudaError at scale
+            # (192 ranks), so disable it (mirrors the cross-node fix below / #1352).
+            env_vars["NCCL_NVLS_ENABLE"] = "0"
+            # NCCL auto-selects the IPoIB interface (ibp*, 100.126/16) for its OOB
+            # bootstrap socket, which is not routable between train/inference nodes
+            # ("Connection refused"). Pin it to the routable ethernet to match the
+            # Megatron workers (see the recipe's megatron_cfg.env_vars). Honor an
+            # explicit override from the driver env if provided.
+            env_vars["NCCL_SOCKET_IFNAME"] = os.environ.get(
+                "NCCL_SOCKET_IFNAME", "enp90s0np0"
+            )
 
         if needs_cross_node_parallelism:
             # When using cross-node model parallelism with non-colocated inference,

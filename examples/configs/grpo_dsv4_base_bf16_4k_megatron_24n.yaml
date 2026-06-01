@@ -70,6 +70,13 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
 
+  # CPU-offload the optimizer (part of the winning config in
+  # docs/dsv4-flash-multinode.md): the per-rank model is ~71 GiB at this layout,
+  # so keep the optimizer state off-GPU to leave headroom for the refit + comms.
+  optimizer_cpu_offload: true
+  optimizer_offload_fraction: 1.0
+  offload_optimizer_for_logprob: true
+
   # DSv4 uses DeepSeek-Sparse-Attention (CSA), which asserts on packed
   # sequences (csa.py:661 asserts packed_seq_params is None). The 8n_ep4
   # base config inherits sequence_packing.enabled=true; override to false
@@ -106,6 +113,8 @@ policy:
     moe_enable_deepep: false
     sequence_parallel: true
     activation_checkpointing: true
+    # Free reserved-but-unused cache between phases (helps the tight refit boundary).
+    empty_unused_memory_level: 2
 
     optimizer:
       lr: 2.0e-7
@@ -122,6 +131,16 @@ policy:
       # Driver < 13.0: keep "1". Driver >= 13.0: set to "0" to use the
       # fused mHC proj-RMS kernel (cuTile).
       NRL_DSV4_DISABLE_FUSED_MHC: "1"
+      # The cross-cluster model_update_group (init_collective) joins train + vLLM
+      # ranks across nodes. NCCL auto-selected the IPoIB interface (ibp*, 100.126/16)
+      # for its out-of-band bootstrap socket, which is not routable between these
+      # nodes ("Connection refused" -> ncclUnhandledCudaError). Pin NCCL's socket/OOB
+      # to the routable ethernet (enp90s0np0, 10.65/16 = the Ray/SLURM node network).
+      # IB/RDMA data transport (mlx5) is unaffected. See docs/dsv4-flash-multinode.md.
+      NCCL_SOCKET_IFNAME: "enp90s0np0"
+      # NVLS can't init across nodes for the cross-cluster group; disable defensively
+      # (mirrors the vLLM-side fix for issue #1352).
+      NCCL_NVLS_ENABLE: "0"
 
   generation:
     max_new_tokens: 2048
