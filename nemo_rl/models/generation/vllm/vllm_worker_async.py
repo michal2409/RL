@@ -315,6 +315,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -461,6 +462,100 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 return res
 
+            async def preprocess_chat(
+                self,
+                request,
+                messages,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
+                tool_dicts=None,
+                tool_parser=None,
+                reasoning_parser=None,
+                *,
+                skip_mm_cache=False,
+            ):
+                # vLLM now routes chat rendering through OpenAIServingRender,
+                # where preprocess_chat replaced _preprocess_chat.
+                for message in messages:
+                    if message.get("tool_calls"):
+                        message["tool_calls"] = list(message["tool_calls"])
+
+                messages_for_replace_prefix_tokens = deepcopy(messages)
+
+                try:
+                    res = await super().preprocess_chat(
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        tool_parser=tool_parser,
+                        reasoning_parser=reasoning_parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                except ValueError as e:
+                    if "maximum context length" in str(e):
+                        import logging
+
+                        logging.getLogger(__name__).warning(
+                            "Prompt exceeds max_model_len: %s", e
+                        )
+                    raise
+
+                if request.required_prefix_token_ids is None:
+                    return res
+
+                last_assistant_message_idx = None
+                for i in reversed(range(len(messages_for_replace_prefix_tokens))):
+                    if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
+                        last_assistant_message_idx = i
+                        break
+
+                if last_assistant_message_idx is None:
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens
+                    )
+                else:
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens[
+                            : last_assistant_message_idx + 1
+                        ]
+                    )
+
+                modified_request = request.model_copy(
+                    update={"add_generation_prompt": False}
+                )
+
+                corresponding_res = await super().preprocess_chat(
+                    request=modified_request,
+                    messages=messages_to_last_assistant_message,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                    reasoning_parser=reasoning_parser,
+                    skip_mm_cache=skip_mm_cache,
+                )
+                actual_corresponding_token_ids = corresponding_res[1][0][
+                    "prompt_token_ids"
+                ]
+
+                engine_prompt = res[1][0]
+
+                final_prompt_token_ids = _replace_prefix_tokens(
+                    tokenizer=self.renderer.tokenizer,
+                    model_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
+                    template_token_ids=engine_prompt["prompt_token_ids"],
+                )
+
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                return res
+
         ########################################
         # /v1/chat/completions endpoint
         ########################################
@@ -475,6 +570,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
             pass
 
+        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingRender.
+        # Chat and tokenization serving delegate chat preprocessing to this object.
+        class NeMoRLOpenAIServingRender(
+            NeMoRLOpenAIServingMixin, OpenAIServingRender
+        ):
+            pass
+
         serving_chat_default_kwargs = dict(
             response_role="assistant",
             request_logger=None,
@@ -484,10 +586,35 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        openai_serving_render = NeMoRLOpenAIServingRender(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            model_registry=openai_serving_models.registry,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+            trust_request_chat_template=serving_chat_kwargs.get(
+                "trust_request_chat_template", False
+            ),
+            enable_auto_tools=serving_chat_kwargs.get("enable_auto_tools", False),
+            exclude_tools_when_tool_choice_none=serving_chat_kwargs.get(
+                "exclude_tools_when_tool_choice_none", False
+            ),
+            tool_parser=serving_chat_kwargs.get("tool_parser"),
+            reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+            default_chat_template_kwargs=serving_chat_kwargs.get(
+                "default_chat_template_kwargs"
+            ),
+            log_error_stack=serving_chat_kwargs.get("log_error_stack", False),
+        )
+        serving_chat_kwargs.pop("log_error_stack", None)
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
+                openai_serving_render=openai_serving_render,
                 return_tokens_as_token_ids=True,
             )
         )
@@ -547,11 +674,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             pass
 
         serving_tokenization_kwargs = dict(
+            openai_serving_render=openai_serving_render,
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
+            default_chat_template_kwargs=serving_chat_kwargs.get(
+                "default_chat_template_kwargs"
+            ),
+            trust_request_chat_template=serving_chat_kwargs.get(
+                "trust_request_chat_template", False
+            ),
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
         )

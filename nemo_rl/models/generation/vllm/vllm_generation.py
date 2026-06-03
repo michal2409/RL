@@ -163,6 +163,12 @@ class VllmGeneration(GenerationInterface):
             env_vars["NCCL_SOCKET_IFNAME"] = os.environ.get(
                 "NCCL_SOCKET_IFNAME", "enp90s0np0"
             )
+            # The 192-rank cross-cluster model_update_group allocates many P2P/CUMEM+RDMA
+            # NCCL channels; at scale this OOMed during channel setup (root-caused via
+            # NCCL_DEBUG). The refit is a once-per-step broadcast, so cap channels and the
+            # per-channel buffer on both sides of the group to bound the comm memory.
+            env_vars["NCCL_MAX_NCHANNELS"] = os.environ.get("NRL_NCCL_MAX_NCHANNELS", "2")
+            env_vars["NCCL_BUFFSIZE"] = os.environ.get("NRL_NCCL_BUFFSIZE", "2097152")
 
         if needs_cross_node_parallelism:
             # When using cross-node model parallelism with non-colocated inference,

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from datetime import timedelta
 from typing import Optional
 
 import torch
@@ -25,11 +27,18 @@ class StatelessProcessGroup:
         self.port = port
         self.rank = rank
         self.world_size = world_size
+        # The default TCPStore timeout (300s) is too short for the cross-cluster
+        # model_update_group at 192 ranks when the vLLM side starts slowly (async
+        # HTTP-server worker + tokenizer load + DeepGEMM warmup, as in the nemo_gym
+        # path): late-arriving ranks can race the NCCL scalable bootstrap and trip an
+        # "unhandled cuda error". Give ranks a generous window to rendezvous.
+        store_timeout_s = int(os.environ.get("NRL_PG_STORE_TIMEOUT_S", "1800"))
         self.tcp_store = torch.distributed.TCPStore(
             host_name=self.master_address,
             port=self.port,
             world_size=self.world_size,
             is_master=(self.rank == 0),
+            timeout=timedelta(seconds=store_timeout_s),
         )
 
     def init_nccl_communicator(self, device: int):

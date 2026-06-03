@@ -57,6 +57,11 @@ class NemoGym(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
+        # In multinode runs, Gym-managed service configs must advertise a real node IP
+        # rather than falling back to localhost, or remote workers will connect to
+        # their own loopback interface instead of the actor-hosted service.
+        initial_global_config_dict.setdefault("default_host", self.node_ip)
+
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
         )
@@ -90,11 +95,19 @@ Depending on your data shape, you may want to change these values."""
             "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
         )
 
+        # When True, a rollout that returns no generation data is replaced by a
+        # 1-token empty response with reward=0 instead of raising. Keeps the batch
+        # size consistent at scale where a small fraction of SWE rollouts may fail
+        # (apptainer flukes, agent crashes, prompt-too-long, etc.).
+        self.allow_empty_rollouts = initial_global_config_dict.pop(
+            "allow_empty_rollouts", False
+        )
+        self._empty_rollout_count = 0
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
-                / "nemo_gym_env.yaml",
+                dotenv_path=Path("/logs") / "nemo_gym_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
             )
@@ -237,13 +250,41 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             prompt_token_ids = tokenizer.apply_chat_template(
                 input_messages, tokenize=True
             )
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+            if not self.allow_empty_rollouts:
+                raise ValueError(
+                    f"NeMo Gym returned a result with no generation data. "
+                    f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
+                    f"so vLLM rejected the request before any tokens could be generated.\n"
+                    f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
+                    f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                    f"to a value larger than {len(prompt_token_ids)}, or set "
+                    f"`env.nemo_gym.allow_empty_rollouts=true` to substitute a 1-token empty response with reward=0."
+                )
+            # Batch-preserving fallback: emit a 1-token empty assistant turn (reward=0)
+            # so a failed SWE rollout doesn't abort the whole step.
+            pad_id = (
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
+            )
+            nemo_rl_message_log = [
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(prompt_token_ids, dtype=torch.long),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([pad_id], dtype=torch.long),
+                    "generation_logprobs": torch.tensor([0.0]),
+                },
+            ]
+            nemo_gym_result.setdefault("reward", 0.0)
+            self._empty_rollout_count += 1
+            print(
+                f"[nemo_gym] empty rollout substituted (count={self._empty_rollout_count})",
+                flush=True,
             )
 
         return {

@@ -1,0 +1,121 @@
+# TINY 1-node plumbing smoke: DeepSeek-V4 (4 layers) GRPO on nemo_gym SWE via Megatron-Bridge.
+# Inherits the validated 1-node tiny megatron config (TP1/PP1/EP8, colocated vLLM) and swaps in
+# the nemo_gym SWE dataset. Purpose: validate config load + venv build (mcore+nemo_gym) +
+# nemo_gym env startup + SWE data load + rollout attempt + megatron step + vLLM refit, cheaply
+# on 1 node. allow_empty_rollouts=true so missing SIF/apptainer runtime yields reward=0 empty
+# turns instead of aborting (SWE prompts also far exceed seqlen=1536, so rollouts are empty here).
+defaults: ../configs/grpo_dsv4_base_tiny_1n_megatron.yaml
+
+sif_dir: "/lustre/fsw/portfolios/coreai/users/lukaszp/data/sif"
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  max_num_epochs: 1
+  max_num_steps: 2
+  val_period: 100000
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+
+checkpointing:
+  enabled: false
+
+policy:
+  megatron_cfg:
+    env_vars:
+      # Exercise the chunked DSA indexer (vendored dsa.py) in real training. The indexer's
+      # [seqlen, index_n_heads, seqlen] fp32 score matrix is the O(seq^2) OOM wall at long
+      # seqlen; chunking the query dim caps the peak at [chunk, index_n_heads, seqlen].
+      # seqlen here is 1536, so a 64-token chunk forces 24 chunks (heavily exercises the
+      # ragged-chunk + grad_k accumulation paths). In production this defaults to 1024.
+      MCORE_DSA_INDEXER_CHUNK_SIZE: "64"
+  generation:
+    vllm_cfg:
+      # The nemo_gym agent talks to the vLLM HTTP server with TEXT messages, so vLLM
+      # must tokenize. The base RL config defaults skip_tokenizer_init=true (token-id
+      # refit path); override to false or the OpenAI chat server has a None tokenizer
+      # (vLLM serving.py:248 `assert tokenizer is not None`).
+      skip_tokenizer_init: false
+      # The SWE agent sends tools with tool_choice=auto. vLLM 0.21's OpenAIServingRender
+      # rejects that (400) unless enable_auto_tools + tool_parser are set on the server
+      # (render/serving.py:219). Mirror grpo-studies' gym config.
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  # dataset_name set explicitly in train/validation (the math base sets DAPOMath17K and the
+  # default-merge is fill-missing only, so it would not otherwise be overridden).
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/lukaszp/data/swe/train.jsonl"
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/lukaszp/data/swe/validation.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: true
+    allow_empty_rollouts: true
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 1
+          concurrency: 4
+          swebench_agent_timeout: 1800
+          openhands_should_log: false
+          base_results_dir: /logs/nemo_gym/swe_agents_train
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          container_formatter:
+            - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
+            - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
+            - "${sif_dir}/r2egym_{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_max_turns}
+          concurrency: 4
+          swebench_agent_timeout: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_agent_timeout}
+          openhands_should_log: false
+          base_results_dir: /logs/nemo_gym/swe_agents_val
+          dataset_path: ${data.validation.data_path}
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+    use_absolute_ip: true
+
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 0
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
