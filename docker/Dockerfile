@@ -56,6 +56,25 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
+# Apptainer — required so the nemo_gym SWE agent (SWE-bench / SWE-gym / R2E-gym) can run each
+# task's environment, which is shipped as a .sif image, via `apptainer exec` nested inside the
+# pyxis/enroot training container. The base images ship without any container runtime, so SIF-based
+# rollouts fail without this. squashfs-tools (mksquashfs/unsquashfs) and uidmap (newuidmap/newgidmap
+# for rootless mode) are runtime deps; remaining deps (libfuse, etc.) are resolved from the .deb.
+RUN <<"EOF" bash -exu -o pipefail
+export DEBIAN_FRONTEND=noninteractive
+APPTAINER_VERSION=1.3.1
+ARCH=$(dpkg --print-architecture)
+apt-get update
+curl --retry 3 --retry-delay 2 -fsSL -o /tmp/apptainer.deb \
+    "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_${ARCH}.deb"
+apt-get install -y --no-install-recommends squashfs-tools uidmap /tmp/apptainer.deb
+rm -f /tmp/apptainer.deb
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+apptainer --version
+EOF
+
 # CMake (for sglang build)
 RUN GITHUB_ARTIFACTORY=github.com \
     && CMAKE_VERSION=3.31.1 \

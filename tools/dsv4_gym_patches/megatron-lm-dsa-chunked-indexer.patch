@@ -1,0 +1,178 @@
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
+index 94f0fae78..0c22dfa5b 100644
+--- a/megatron/core/transformer/experimental_attention_variant/dsa.py
++++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
+@@ -2,6 +2,7 @@
+ 
+ import copy
+ import math
++import os
+ from dataclasses import dataclass
+ from typing import List, Optional, Tuple, Union
+ 
+@@ -316,6 +317,28 @@ def compute_dsa_indexer_loss(
+     return indexer_loss
+ 
+ 
++def _dsa_indexer_chunk_size(seqlen_q: int) -> int:
++    """Query-dimension chunk size for the DSA indexer score computation.
++
++    The naive indexer materializes the full ``[seqlen_q, batch, index_n_heads, seqlen_k]``
++    score tensor (O(seqlen^2 * index_n_heads), fp32). At SWE-length sequences this is tens
++    of GiB and OOMs. Chunking the query dimension caps the peak at
++    ``[chunk, batch, index_n_heads, seqlen_k]`` while keeping the math identical (the
++    head-sum and top-k are per-query-row, so query chunks are independent).
++
++    Controlled by ``MCORE_DSA_INDEXER_CHUNK_SIZE`` (number of query positions per chunk).
++    ``0`` (or a value >= seqlen_q) disables chunking and recovers the original single-pass
++    computation.
++    """
++    try:
++        chunk = int(os.environ.get("MCORE_DSA_INDEXER_CHUNK_SIZE", "1024"))
++    except ValueError:
++        chunk = 1024
++    if chunk <= 0 or chunk >= seqlen_q:
++        return seqlen_q
++    return chunk
++
++
+ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+     """
+     Perform index score using BF16 precision.
+@@ -328,6 +351,11 @@ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tenso
+         3. Weight by attention weights;
+         4. Sum across attention heads.
+ 
++    The query dimension is processed in chunks (see ``_dsa_indexer_chunk_size``) so the
++    full ``[seqlen_q, batch, index_n_heads, seqlen_k]`` intermediate is never materialized;
++    only one ``[chunk, batch, index_n_heads, seqlen_k]`` slice exists at a time. The result
++    ``[batch, seqlen_q, seqlen_k]`` is bit-for-bit identical to the single-pass version.
++
+     Args:
+         q: BF16 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
+         weights: BF16 [seqlen_q, batch, index_n_heads], the attention weights.
+@@ -336,25 +364,31 @@ def _compute_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tenso
+     Returns:
+         index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
+     """
+-    # Compute attention scores: q @ k^T
+-    # [seqlen_q, batch, index_n_heads, index_head_dim] @ [seqlen_k, batch, index_head_dim]^T
+-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
+-    index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+-
+-    # Apply ReLU activation.
+-    index_scores = torch.relu(index_scores)
+-
+-    # Weight each head by attention weights.
+-    # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
+-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
+-    index_scores = index_scores * weights.unsqueeze(-1)
+-
+-    # Sum across attention heads.
+-    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
+-    index_scores = index_scores.sum(dim=2)
++    seqlen_q, batch = q.size(0), q.size(1)
++    seqlen_k = k.size(0)
++    chunk = _dsa_indexer_chunk_size(seqlen_q)
++
++    # Cast k once; reused across all query chunks.
++    k_f = k.float()
++    index_scores = torch.empty(
++        (batch, seqlen_q, seqlen_k), dtype=torch.float32, device=q.device
++    )
+ 
+-    # Transpose to [batch, seqlen_q, seqlen_k].
+-    index_scores = index_scores.transpose(0, 1)
++    for start in range(0, seqlen_q, chunk):
++        end = min(start + chunk, seqlen_q)
++        # Compute attention scores for this query chunk: q @ k^T
++        # [chunk, batch, index_n_heads, index_head_dim] @ [seqlen_k, batch, index_head_dim]^T
++        #   -> [chunk, batch, index_n_heads, seqlen_k]
++        scores_chunk = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_f)
++        # Apply ReLU activation.
++        scores_chunk = torch.relu(scores_chunk)
++        # Weight each head by attention weights.
++        # [chunk, batch, index_n_heads, seqlen_k] * [chunk, batch, index_n_heads, 1]
++        scores_chunk = scores_chunk * weights[start:end].unsqueeze(-1)
++        # Sum across attention heads: [chunk, batch, index_n_heads, seqlen_k] -> [chunk, batch, seqlen_k]
++        scores_chunk = scores_chunk.sum(dim=2)
++        # Write into [batch, seqlen_q, seqlen_k] (transpose chunk's seq/batch dims).
++        index_scores[:, start:end, :] = scores_chunk.transpose(0, 1)
+ 
+     return index_scores
+ 
+@@ -584,31 +618,49 @@ def bwd_fused_indexer_loss_naive(
+     grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
+     del grad_index_scores
+ 
+-    # Compute forward values needed for backward
+-    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
+-    # Compute relu_mask before relu (saves memory vs keeping both scores and relu output)
+-    relu_mask = scores > 0
+-    scores_after_relu = torch.relu(scores)
+-    del scores
+-
+-    # Backward through multiplication by weights: index_scores_per_head * weights
+-    # ∂L/∂weights = grad * relu_scores (sum over sk)
+-    grad_weights = (grad_weighted_scores * scores_after_relu).sum(dim=-1)  # [sq, b, h]
+-
+-    # ∂L/∂relu_scores = grad * weights
+-    grad_scores_after_relu = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
+-    del grad_weighted_scores, scores_after_relu
+-
+-    # Backward through ReLU
+-    grad_scores = grad_scores_after_relu * relu_mask.float()  # [sq, b, h, sk]
+-    del grad_scores_after_relu, relu_mask
+-
+-    # Backward through einsum 'sbhd,tbd->sbht'
+-    # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
+-    grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())  # [sq, b, h, d]
+-    # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)
+-    grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())  # [sk, b, d]
+-    del grad_scores
++    # The remaining work recomputes the forward [sq, b, h, sk] score tensor and several
++    # same-shape gradient tensors. Materializing them all at once is the O(seqlen^2 *
++    # index_n_heads) OOM wall. Chunk the query dimension: grad_q / grad_weights are
++    # per-query-row (independent across chunks); grad_k is a sum over the query dim, so it
++    # is accumulated across chunks. Math is identical to the single-pass version.
++    # Indexer dims (distinct from the main-attention np/hn derived from `query` above):
++    # q is [sq, b, index_n_heads, index_head_dim]; k is [sk, b, index_head_dim].
++    index_n_heads, index_head_dim = q.size(2), q.size(3)
++    chunk = _dsa_indexer_chunk_size(sq)
++    k_f = k.float()
++    grad_q = torch.empty((sq, b, index_n_heads, index_head_dim), dtype=torch.float32, device=q.device)
++    grad_weights = torch.empty((sq, b, index_n_heads), dtype=torch.float32, device=q.device)
++    grad_k = torch.zeros((sk, b, index_head_dim), dtype=torch.float32, device=q.device)
++
++    for start in range(0, sq, chunk):
++        end = min(start + chunk, sq)
++        gws_c = grad_weighted_scores[start:end]  # [c, b, 1, sk]
++        q_c = q[start:end].float()  # [c, b, h, d]
++
++        # Recompute forward values for this query chunk
++        scores_c = torch.einsum('sbhd,tbd->sbht', q_c, k_f)  # [c, b, h, sk]
++        # relu_mask before relu (saves memory vs keeping both scores and relu output)
++        relu_mask_c = scores_c > 0
++        scores_after_relu_c = torch.relu(scores_c)
++        del scores_c
++
++        # ∂L/∂weights = grad * relu_scores (sum over sk)
++        grad_weights[start:end] = (gws_c * scores_after_relu_c).sum(dim=-1)  # [c, b, h]
++        del scores_after_relu_c
++
++        # ∂L/∂relu_scores = grad * weights, then backward through ReLU
++        grad_scores_c = gws_c * weights[start:end].unsqueeze(-1)  # [c, b, h, sk]
++        grad_scores_c = grad_scores_c * relu_mask_c.float()
++        del relu_mask_c
++
++        # Backward through einsum 'sbhd,tbd->sbht'
++        # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
++        grad_q[start:end] = torch.einsum('sbht,tbd->sbhd', grad_scores_c, k_f)  # [c, b, h, d]
++        # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q); summed over the query dim
++        grad_k += torch.einsum('sbht,sbhd->tbd', grad_scores_c, q_c)  # [sk, b, d]
++        del grad_scores_c, q_c, gws_c
++
++    del grad_weighted_scores
+ 
+     return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
+ 
