@@ -8,6 +8,16 @@ diff --git a/responses_api_agents/swe_agents/app.py b/responses_api_agents/swe_a
 +        description="Directory for SWE run artifacts. Use a shared filesystem for multinode Ray runs.",
 +    )
      debug: bool = False
+@@ -513,6 +517,7 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
+             f'export PATH="{self.config.r2e_gym_setup_dir}/uv/bin:$PATH" && '
++            f'export PYTHONPATH="/r2egym_setup/R2E-Gym/src:{self.config.r2e_gym_setup_dir}/R2E-Gym/src:$PYTHONPATH" && '
+             # Run with clean environment to avoid venv contamination
+-            # Use the pre-built venv directly with its absolute path
+-            f"env -u VIRTUAL_ENV {self.config.r2e_gym_setup_dir}/R2E-Gym/venv/bin/python src/r2egym/agenthub/run/run_local_evaluation.py "
++            # Use the pre-built venv directly from the mounted setup directory.
++            "env -u VIRTUAL_ENV /r2egym_setup/R2E-Gym/venv/bin/python -m r2egym.agenthub.run.run_local_evaluation "
+             f"    --predictions_path {self.config.output_for_eval_mounted_path} "
+             f"    --instance_id {self.config.instance_id} "
 @@ -1367,3 +1371,3 @@ class RunOpenHandsAgent(BaseModel):
          logs_dir = self.config.persistent_dir / "apptainer_logs"
 -        logs_dir.mkdir(exist_ok=True)

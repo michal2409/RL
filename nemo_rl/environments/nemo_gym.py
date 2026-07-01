@@ -286,9 +286,32 @@ Depending on your data shape, you may want to change these values."""
                         continue
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
+                    try:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_result, tokenizer
+                        )
+                    except Exception as exc:
+                        # Router-replay metadata is a required training
+                        # invariant; do not hide those configuration errors.
+                        if self.cfg.get("require_routed_experts", False):
+                            raise
+                        print(
+                            "  [nemo_gym] WARNING: failed to postprocess rollout "
+                            f"{nemo_gym_row.get('_rowidx', '<unknown>')} "
+                            f"({type(exc).__name__}: {exc}); back-filling a "
+                            "masked zero-reward trajectory.",
+                            flush=True,
+                        )
+                        fallback_result = (
+                            nemo_gym_result
+                            if isinstance(nemo_gym_result, dict)
+                            else None
+                        )
+                        nemo_rl_result = self._zero_reward_nemo_rl_result(
+                            tokenizer,
+                            fallback_result,
+                            reason=f"postprocess_failed:{type(exc).__name__}: {exc}",
+                        )
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
@@ -326,11 +349,9 @@ Depending on your data shape, you may want to change these values."""
             )
             for rowidx, result in enumerate(nemo_rl_sort_results):
                 if result is None:
-                    nemo_rl_sort_results[rowidx] = (
-                        self._postprocess_nemo_gym_to_nemo_rl_result(
-                            {"response": {"output": []}, "reward": 0.0},
-                            tokenizer,
-                        )
+                    nemo_rl_sort_results[rowidx] = self._zero_reward_nemo_rl_result(
+                        tokenizer,
+                        reason="rollout_failed",
                     )
         nemo_rl_results = nemo_rl_sort_results
 
@@ -346,6 +367,51 @@ Depending on your data shape, you may want to change these values."""
 
         return nemo_rl_results, timing_metrics
 
+    def _zero_reward_nemo_rl_result(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        nemo_gym_result: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a shape-safe masked trajectory for a failed Gym rollout."""
+        fallback_token = tokenizer.pad_token_id
+        if fallback_token is None:
+            fallback_token = tokenizer.eos_token_id
+        if fallback_token is None:
+            fallback_token = 0
+
+        if nemo_gym_result is None:
+            nemo_gym_result = {}
+        response = nemo_gym_result.get("response")
+        if not isinstance(response, dict):
+            response = {}
+            nemo_gym_result["response"] = response
+        if not isinstance(response.get("output"), list):
+            response["output"] = []
+        nemo_gym_result["reward"] = 0.0
+        if reason is not None:
+            nemo_gym_result["nemo_rl_fallback_reason"] = reason
+
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(
+                    [fallback_token, fallback_token], dtype=torch.int64
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([fallback_token], dtype=torch.int64),
+            },
+        ]
+        return {
+            "message_log": message_log,
+            "input_message_log": message_log[:1],
+            "full_result": nemo_gym_result,
+        }
+
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
     ) -> dict:
@@ -353,15 +419,26 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
+        response = nemo_gym_result.get("response")
+        response_output = response.get("output") if isinstance(response, dict) else None
+        if not isinstance(response_output, list):
+            return self._zero_reward_nemo_rl_result(
+                tokenizer,
+                nemo_gym_result,
+                reason=f"malformed_response_output:{type(response_output).__name__}",
+            )
+
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
-        for output_item_dict in nemo_gym_result["response"]["output"]:
+        for output_item_dict in response_output:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
             # Eventually we can maybe be smarter about this, but this is functional for now.
 
             # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
+            if not isinstance(output_item_dict, dict):
+                continue
             if "generation_token_ids" not in output_item_dict:
                 continue
 
@@ -481,31 +558,17 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 except Exception as exc:
                     prompt_length = f"unknown ({type(exc).__name__}: {exc})"
 
-            fallback_token = tokenizer.pad_token_id
-            if fallback_token is None:
-                fallback_token = tokenizer.eos_token_id
-            if fallback_token is None:
-                fallback_token = 0
-
             print(
                 "NeMo Gym returned no assistant generation "
                 f"(prompt length: {prompt_length} tokens); treating it as a "
                 "masked zero-reward trajectory.",
                 flush=True,
             )
-            nemo_rl_message_log = [
-                {
-                    "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor([fallback_token, fallback_token]),
-                },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor([fallback_token]),
-                },
-            ]
-            nemo_gym_result["reward"] = 0.0
+            return self._zero_reward_nemo_rl_result(
+                tokenizer,
+                nemo_gym_result,
+                reason="no_generation_data",
+            )
 
         return {
             "message_log": nemo_rl_message_log,
