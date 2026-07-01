@@ -1,0 +1,25 @@
+diff --git a/responses_api_models/vllm_model/app.py b/responses_api_models/vllm_model/app.py
+--- a/responses_api_models/vllm_model/app.py
++++ b/responses_api_models/vllm_model/app.py
+@@ -58,3 +58,6 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
+     uses_reasoning_parser: bool
+     uses_interleaved_reasoning: bool = True
++    # Some chat templates ignore separate reasoning fields on tool-call messages.
++    preserve_reasoning_content_for_tool_calls: bool = False
++
+     replace_developer_role_with_system: bool = False
+@@ -321,5 +324,13 @@ class VLLMModel(SimpleResponsesAPIModel):
+             for message_dict in body_dict["messages"]:
+                 if message_dict.get("role") != "assistant" or "content" not in message_dict:
+                     continue
+-
++
++                # Qwen3.5 tool-call history must retain reasoning in content.
++                # Its chat template omits separate reasoning fields on structured
++                # tool-call messages, which otherwise breaks token contiguity.
++                if self.config.preserve_reasoning_content_for_tool_calls and message_dict.get(
++                    "tool_calls"
++                ):
++                    continue
++
+                 content = message_dict["content"]

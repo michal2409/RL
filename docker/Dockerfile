@@ -264,6 +264,21 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
+
+# Qwen3.5 requires reasoning text to remain in structured tool-call history so
+# subsequent turns preserve the exact generated token prefix.
+RUN <<"EOF" bash -exu -o pipefail
+GYM_DIR=3rdparty/Gym-workspace/Gym
+PATCH_FILE=/opt/nemo-rl/docker/gym/qwen35-gym-vllm-model.patch
+if git -C "${GYM_DIR}" apply --check "${PATCH_FILE}"; then
+    git -C "${GYM_DIR}" apply "${PATCH_FILE}"
+elif git -C "${GYM_DIR}" apply --reverse --check "${PATCH_FILE}"; then
+    echo "Qwen3.5 Gym patch is already applied"
+else
+    git -C "${GYM_DIR}" apply --check "${PATCH_FILE}"
+fi
+EOF
+
 RUN <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
