@@ -313,6 +313,7 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   swanlab_enabled: false
+  mlperf_enabled: true
   monitor_gpus: true
   wandb:
     project: grpo-dev
@@ -321,6 +322,13 @@ logger:
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
+  mlperf:
+    enabled: true
+    # Set MLPERF_SUBMISSION_ORG and MLPERF_SUBMISSION_PLATFORM in the job environment.
+    benchmark: qwen35_397b_grpo_swe
+    target_accuracy: ${oc.env:MLPERF_TARGET_ACCURACY,1.0}
+    force_success_status: false
+    log_file: ${oc.env:MLPERF_LOG_FILE,logs/mllogger.log}
 
 cluster:
   gpus_per_node: 8
