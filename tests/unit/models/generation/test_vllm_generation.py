@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -43,6 +44,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _is_validation_request,
+    _normalize_weight_update_results,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -76,6 +78,28 @@ def test_validation_request_falls_back_to_configured_sampler():
     }
 
     assert _is_validation_request(request, generation_config)
+
+
+def test_weight_update_result_validation_checks_every_vllm_rank():
+    success, errors = _normalize_weight_update_results([True, False, True])
+
+    assert not success
+    assert errors == [None, "worker returned False", None]
+
+
+def test_async_weight_update_raises_when_any_vllm_rank_fails():
+    class FakeLLM:
+        async def collective_rpc(self, method, args):
+            assert method == "update_weights_via_ipc_zmq"
+            assert args == ()
+            return [True, False]
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = FakeLLM()
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+
+    with pytest.raises(RuntimeError, match="IPC/ZMQ"):
+        asyncio.run(worker.update_weights_via_ipc_zmq_async())
 
 
 # Define basic vLLM test config

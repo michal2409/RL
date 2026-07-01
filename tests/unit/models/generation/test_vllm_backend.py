@@ -180,3 +180,53 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
     with pytest.raises(ValueError, match="No MTP layer weights"):
         ext.load_mtp_weights_from_disk(str(model_dir))
     ext._load_draft_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_qwen35_moe_refit_loads_local_experts_into_blocked_layout():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    class Experts:
+        def __init__(self):
+            self.w13_weight = torch.nn.Parameter(torch.zeros(1, 2, 2, 2))
+            self.w2_weight = torch.nn.Parameter(torch.zeros(1, 2, 2, 2))
+
+        @staticmethod
+        def _map_global_expert_id_to_local_expert_id(expert_id):
+            return 0 if expert_id == 1 else -1
+
+    class Qwen35Model:
+        is_3d_moe_weight = True
+
+        def __init__(self, experts):
+            layer = SimpleNamespace(mlp=SimpleNamespace(experts=experts))
+            self.language_model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+            self.loaded_weights = []
+
+        def load_weights(self, weights):
+            self.loaded_weights.extend(weights)
+
+    experts = Experts()
+    model = Qwen35Model(experts)
+    model_runner = SimpleNamespace(model=model)
+
+    normal_weight = torch.tensor([7.0])
+    gate_up = torch.arange(16, dtype=torch.float32).view(2, 2, 4)
+    down = torch.arange(16, 32, dtype=torch.float32).view(2, 4, 2)
+    weights = [
+        ("model.language_model.layers.0.input_layernorm.weight", normal_weight),
+        ("model.language_model.layers.0.mlp.experts.gate_up_proj", gate_up),
+        ("model.language_model.layers.0.mlp.experts.down_proj", down),
+    ]
+
+    VllmInternalWorkerExtension._load_policy_weights_with_diagnostics(
+        weights, model_runner
+    )
+
+    assert model.loaded_weights == [weights[0]]
+    expected_gate_up = gate_up[1].view(2, 2, 2).permute(1, 0, 2)
+    expected_down = down[1].view(2, 2, 2).permute(0, 2, 1)
+    torch.testing.assert_close(experts.w13_weight[0], expected_gate_up)
+    torch.testing.assert_close(experts.w2_weight[0], expected_down)

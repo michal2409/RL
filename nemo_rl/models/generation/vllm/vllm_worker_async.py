@@ -55,6 +55,51 @@ _NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
 _NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY = "_validation_generation"
 
 
+def _normalize_weight_update_results(worker_results: Any) -> tuple[bool, list[Any]]:
+    """Validate every vLLM rank result returned by ``collective_rpc``."""
+    if isinstance(worker_results, bool):
+        return worker_results, [
+            None if worker_results else "collective_rpc returned False"
+        ]
+
+    if worker_results is None:
+        return True, [None]
+
+    try:
+        result_items = list(worker_results)
+    except TypeError:
+        success = bool(worker_results)
+        return success, [
+            None if success else f"Unexpected collective_rpc result: {worker_results!r}"
+        ]
+
+    if not result_items:
+        return False, ["collective_rpc returned no worker results"]
+
+    success_flags = []
+    errors = []
+    for result in result_items:
+        if isinstance(result, bool):
+            success_flags.append(result)
+            errors.append(None if result else "worker returned False")
+        elif result is None:
+            success_flags.append(True)
+            errors.append(None)
+        elif isinstance(result, (list, tuple)):
+            if not result:
+                success_flags.append(False)
+                errors.append("worker returned an empty result")
+            else:
+                success_flags.append(bool(result[0]))
+                errors.append(result[1] if len(result) > 1 else None)
+        else:
+            success = bool(result)
+            success_flags.append(success)
+            errors.append(None if success else f"Unexpected worker result: {result!r}")
+
+    return all(success_flags), errors
+
+
 def _pop_nemo_rl_request_type(request: Any) -> Optional[str]:
     """Remove and return NeMo-RL-only metadata before template rendering."""
     chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
@@ -1570,20 +1615,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+            all_success, errors = _normalize_weight_update_results(worker_results)
+            if not all_success:
+                raise RuntimeError(
+                    f"Worker failed to update weights via IPC/ZMQ. Result: {errors}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
@@ -1606,20 +1649,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+            all_success, errors = _normalize_weight_update_results(worker_results)
+            if not all_success:
+                raise RuntimeError(
+                    f"Worker failed to update weights from collective. Result: {errors}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""

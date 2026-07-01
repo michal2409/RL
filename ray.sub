@@ -377,6 +377,10 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 source $LOG_DIR/topology_probe.sh
 
 cat <<EOFINNER | tee /launch-head.sh
+# A failed or requeued job can leave Ray's persisted session metadata behind.
+# Clear it on every retry so the new head does not reuse an incompatible session.
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
 ray start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
@@ -489,6 +493,9 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 source $LOG_DIR/topology_probe.sh
 
 cat <<EOFINNER | tee /launch-worker.sh
+# Clear a half-started raylet and its persisted session before every retry.
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
 ray start --address "$ip_head" \
           --disable-usage-stats \
           --resources="\$RAY_RESOURCES" \
