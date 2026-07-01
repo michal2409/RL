@@ -58,4 +58,3 @@ COPY --chmod=0666 build_swe_sif_images.py .
 
 ENTRYPOINT ["/workspace/entrypoint.sh"]
 CMD ["/bin/bash"]
-
