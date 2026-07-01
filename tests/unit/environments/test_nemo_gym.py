@@ -11,14 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import time
 from copy import deepcopy
 from pathlib import Path
+from types import MethodType
 
 import pytest
 import ray
 import torch
+from aiohttp import ClientConnectionError
 from yaml import safe_load
 
 from nemo_rl.algorithms.grpo import MasterConfig
@@ -221,6 +224,74 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def test_nemo_gym_postprocess_empty_generation_is_masked_zero_reward():
+    class _Tokenizer:
+        pad_token_id = 7
+        eos_token_id = 8
+
+        def apply_chat_template(self, messages, tokenize=True):
+            return [1, 2, 3]
+
+    class _MockSelf:
+        cfg = {}
+
+    nemo_gym_result = {
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "x"}]},
+        "reward": 1.0,
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert result["full_result"]["reward"] == 0.0
+    assert result["message_log"][0]["token_ids"].tolist() == [7, 7]
+    assert result["message_log"][1]["token_ids"].tolist() == [7]
+    assert "generation_logprobs" not in result["message_log"][1]
+
+
+def test_nemo_gym_transport_failure_preserves_batch_shape():
+    async def failed_rollout():
+        raise ClientConnectionError("transient failure")
+
+    class _RolloutCollectionHelper:
+        def run_examples(self, examples, head_server_config):
+            return [failed_rollout()]
+
+    class _Tokenizer:
+        pad_token_id = 7
+        eos_token_id = 8
+
+    class _MockSelf:
+        cfg = {}
+        rollout_max_attempts_to_avoid_lp_nan = 1
+        rch = _RolloutCollectionHelper()
+        head_server_config = object()
+
+    mock_self = _MockSelf()
+    postprocess = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+    )
+    mock_self._postprocess_nemo_gym_to_nemo_rl_result = MethodType(
+        postprocess, mock_self
+    )
+
+    results, _ = asyncio.run(
+        NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            mock_self,
+            [{"_rowidx": 0}],
+            _Tokenizer(),
+            "timing/rollout",
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0]["full_result"]["reward"] == 0.0
 
 
 @pytest.mark.nemo_gym

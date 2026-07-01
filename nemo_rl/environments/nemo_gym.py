@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
+import aiohttp
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -272,7 +274,16 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        print(
+                            "  [nemo_gym] WARNING: rollout failed "
+                            f"({type(exc).__name__}: {exc}); back-filling a "
+                            "masked zero-reward trajectory.",
+                            flush=True,
+                        )
+                        continue
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -305,13 +316,32 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
             nemo_rl_sort_results[rowidx] = result
+
+        num_failed = sum(result is None for result in nemo_rl_sort_results)
+        if num_failed:
+            print(
+                f"  [nemo_gym] WARNING: back-filling {num_failed}/"
+                f"{nemo_gym_num_rows} failed rollout(s) to preserve batch shape.",
+                flush=True,
+            )
+            for rowidx, result in enumerate(nemo_rl_sort_results):
+                if result is None:
+                    nemo_rl_sort_results[rowidx] = (
+                        self._postprocess_nemo_gym_to_nemo_rl_result(
+                            {"response": {"output": []}, "reward": 0.0},
+                            tokenizer,
+                        )
+                    )
         nemo_rl_results = nemo_rl_sort_results
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
         total_time = timing_metrics.pop("_run_rollouts_total")
+        postprocess_time = timing_metrics.get(
+            f"{timer_prefix}/postprocess_results", 0.0
+        )
         timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+            100 * postprocess_time / total_time if total_time else 0.0
         )
 
         return nemo_rl_results, timing_metrics
@@ -438,18 +468,44 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
+            input_messages = nemo_gym_result.get("responses_create_params", {}).get(
+                "input"
             )
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+            prompt_length = "unknown"
+            if input_messages is not None:
+                try:
+                    prompt_token_ids = tokenizer.apply_chat_template(
+                        input_messages, tokenize=True
+                    )
+                    prompt_length = str(len(prompt_token_ids))
+                except Exception as exc:
+                    prompt_length = f"unknown ({type(exc).__name__}: {exc})"
+
+            fallback_token = tokenizer.pad_token_id
+            if fallback_token is None:
+                fallback_token = tokenizer.eos_token_id
+            if fallback_token is None:
+                fallback_token = 0
+
+            print(
+                "NeMo Gym returned no assistant generation "
+                f"(prompt length: {prompt_length} tokens); treating it as a "
+                "masked zero-reward trajectory.",
+                flush=True,
             )
+            nemo_rl_message_log = [
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token, fallback_token]),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token]),
+                },
+            ]
+            nemo_gym_result["reward"] = 0.0
 
         return {
             "message_log": nemo_rl_message_log,
