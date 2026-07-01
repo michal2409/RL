@@ -50,6 +50,51 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
 
+_NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
+_NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
+_NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY = "_validation_generation"
+
+
+def _pop_nemo_rl_request_type(request: Any) -> Optional[str]:
+    """Remove and return NeMo-RL-only metadata before template rendering."""
+    chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+    assert isinstance(chat_template_kwargs, dict), (
+        "Chat completion request chat_template_kwargs must be a dict."
+    )
+    chat_template_kwargs = dict(chat_template_kwargs)
+    request_type = chat_template_kwargs.pop(_NEMO_RL_REQUEST_TYPE_METADATA_KEY, None)
+    if request_type is not None:
+        request.chat_template_kwargs = chat_template_kwargs
+    return request_type
+
+
+def _is_validation_request(request: Any, generation_config: dict[str, Any]) -> bool:
+    """Identify validation requests while keeping training checks strict."""
+    request_type = _pop_nemo_rl_request_type(request)
+    if request_type is not None:
+        assert request_type == _NEMO_RL_VALIDATION_REQUEST_TYPE, (
+            f"Unsupported NeMo RL request type: {request_type!r}."
+        )
+        return True
+
+    validation_generation = generation_config.get(
+        _NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY
+    )
+    if validation_generation is None:
+        return False
+
+    if (
+        validation_generation["temperature"] == generation_config["temperature"]
+        and validation_generation["top_p"] == generation_config["top_p"]
+    ):
+        return False
+
+    request_top_p = 1.0 if request.top_p is None else request.top_p
+    return (
+        request.temperature == validation_generation["temperature"]
+        and request_top_p == validation_generation["top_p"]
+    )
+
 
 def _replace_prefix_tokens(
     tokenizer,
@@ -770,10 +815,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             )
             request.top_k = -1
 
-            # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # Training requests must exactly match the policy sampler; validation
+            # requests are metric-only and may use deterministic parameters.
+            if not _is_validation_request(request, generation_config):
+                assert request.temperature == generation_config["temperature"]
+                assert request.top_p == generation_config["top_p"]
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(

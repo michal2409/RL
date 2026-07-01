@@ -134,6 +134,8 @@ class GenerationConfig(TypedDict):
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # Internal validation sampler metadata used by the NeMo-Gym HTTP path.
+    _validation_generation: NotRequired[dict[str, float]]
 
 
 class GenerationDatumSpec(TypedDict):

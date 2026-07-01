@@ -19,6 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,12 +42,42 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _is_validation_request,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_validation_request_marker_bypasses_training_sampler_match():
+    request = SimpleNamespace(
+        chat_template_kwargs={"_nemo_rl_request_type": "validation"},
+        temperature=0.0,
+        top_p=1.0,
+    )
+    generation_config = {"temperature": 1.0, "top_p": 0.9}
+
+    assert _is_validation_request(request, generation_config)
+    assert request.chat_template_kwargs == {}
+
+
+def test_validation_request_falls_back_to_configured_sampler():
+    request = SimpleNamespace(
+        chat_template_kwargs={},
+        temperature=0.0,
+        top_p=None,
+    )
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 0.9,
+        "_validation_generation": {"temperature": 0.0, "top_p": 1.0},
+    }
+
+    assert _is_validation_request(request, generation_config)
+
+
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",

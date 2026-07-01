@@ -157,6 +157,13 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
+class ValidationGenerationConfig(TypedDict):
+    """Sampling parameters used only for validation rollouts."""
+
+    temperature: float
+    top_p: float
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -177,6 +184,7 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
+    validation_generation: NotRequired[ValidationGenerationConfig | None]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -303,6 +311,10 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+
+    validation_generation_config = grpo_config.get("validation_generation")
+    if validation_generation_config is not None:
+        generation_config["_validation_generation"] = dict(validation_generation_config)
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -3193,6 +3205,11 @@ def validate(
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        validation_generation_config = master_config.grpo.get("validation_generation")
+        use_nemo_gym = _should_use_nemo_gym(master_config)
+        assert validation_generation_config is None or use_nemo_gym, (
+            "grpo.validation_generation is only supported for NeMo-Gym validation."
+        )
 
         max_batches = (
             master_config.grpo["max_val_samples"]
@@ -3206,8 +3223,15 @@ def validate(
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
-            if _should_use_nemo_gym(master_config):
+            if use_nemo_gym:
                 generation_config = master_config.policy["generation"]
+                if validation_generation_config is not None:
+                    generation_config = dict(generation_config)
+                    generation_config["temperature"] = validation_generation_config[
+                        "temperature"
+                    ]
+                    generation_config["top_p"] = validation_generation_config["top_p"]
+
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -3218,6 +3242,7 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    mark_validation_request=validation_generation_config is not None,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
