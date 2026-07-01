@@ -7,14 +7,14 @@ defaults: grpo_qwen35_397ba17b_swe_openhands_async.yaml
 
 grpo:
   num_prompts_per_step: 16
-  num_generations_per_prompt: 8
+  num_generations_per_prompt: 16
   max_num_steps: 20
   val_period: 2
   val_at_start: true
   val_at_end: true
 
 policy:
-  train_global_batch_size: 128
+  train_global_batch_size: 256
   megatron_cfg:
     optimizer:
       lr: 2.0e-6
@@ -24,7 +24,13 @@ policy:
 
 env:
   nemo_gym:
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          concurrency: 128
+          swebench_agent_timeout: 600
     swe_agents_val:
       responses_api_agents:
         swe_agents:
+          concurrency: 128
           swebench_agent_timeout: 600
