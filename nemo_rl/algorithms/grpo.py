@@ -1493,6 +1493,32 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                 )
 
 
+def _stable_group_ids(
+    prompt_ids_for_adv: torch.Tensor,
+    num_generations_per_prompt: int,
+) -> torch.Tensor:
+    """Return positional prompt-group IDs for contiguous rollout groups.
+
+    Agentic NeMo-Gym rollouts can render the same logical prompt differently
+    across generations (for example, after tool/reasoning normalization).  If
+    the rendered token IDs are used as GRPO group keys, each response can become
+    a singleton group and receive a zero advantage.  NeMo-Gym batches retain the
+    stronger invariant that generations for a prompt are contiguous, so use
+    that layout as the grouping key.
+
+    Fall back to token IDs when the batch cannot contain complete prompt groups,
+    as can happen during dynamic sampling.
+    """
+    num_samples = int(prompt_ids_for_adv.shape[0])
+    group_size = int(num_generations_per_prompt)
+    if group_size <= 0 or num_samples % group_size != 0:
+        return prompt_ids_for_adv
+
+    return (
+        torch.arange(num_samples, device=prompt_ids_for_adv.device) // group_size
+    ).unsqueeze(1)
+
+
 def _resolve_message_level_advantage_penalties(
     master_config: MasterConfig,
 ) -> tuple[float | None, float | None]:
@@ -2689,8 +2715,15 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config.grpo["num_generations_per_prompt"],
+                        )
+
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -3908,8 +3941,15 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config.grpo["num_generations_per_prompt"],
+                        )
+
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
