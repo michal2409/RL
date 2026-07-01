@@ -96,11 +96,59 @@ def _is_validation_request(request: Any, generation_config: dict[str, Any]) -> b
     )
 
 
+def _find_nth_token_from_end(token_ids: list[int], token_id: int, n: int) -> int:
+    """Return the index of the nth matching token from the end, or -1."""
+    if n <= 0:
+        return -1
+
+    seen = 0
+    for idx in reversed(range(len(token_ids))):
+        if token_ids[idx] == token_id:
+            seen += 1
+            if seen == n:
+                return idx
+    return -1
+
+
+def _replace_prefix_from_suffix_messages(
+    *,
+    eos_token_id: int,
+    model_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+    suffix_message_count: Optional[int],
+) -> Optional[list[int]]:
+    """Repair a non-monotonic prefix using trailing message boundaries.
+
+    Qwen3.5 can normalize reasoning/tool-call history differently when a prefix
+    is rendered in isolation.  The complete template is still reliable for the
+    messages after the last assistant turn, so splice at their EOS boundary.
+    """
+    if suffix_message_count is None:
+        return None
+
+    template_cut_start = _find_nth_token_from_end(
+        template_token_ids,
+        eos_token_id,
+        suffix_message_count + 1,
+    )
+    if template_cut_start < 0:
+        return None
+
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids and model_prefix_token_ids[-1] == eos_token_id:
+        model_cut_end -= 1
+
+    return (
+        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    )
+
+
 def _replace_prefix_tokens(
     tokenizer,
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    suffix_message_count: Optional[int] = None,
 ) -> list[int]:
     """This is a subroutine used inside the vLLM Chat Completion server.
 
@@ -164,6 +212,22 @@ def _replace_prefix_tokens(
         # And since chat templates will always add one for us, we just cut the model input to right before the EOS token ID (if applicable)
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
+
+    prefix_is_monotonic = (
+        template_token_ids[: len(template_prefix_token_ids)]
+        == template_prefix_token_ids
+    )
+    if not prefix_is_monotonic or len(template_token_ids) <= len(
+        template_prefix_token_ids
+    ):
+        repaired_token_ids = _replace_prefix_from_suffix_messages(
+            eos_token_id=eos_token_id,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_token_ids=template_token_ids,
+            suffix_message_count=suffix_message_count,
+        )
+        if repaired_token_ids is not None:
+            return repaired_token_ids
 
     # Assert here to prepare for the logic below
     assert len(template_token_ids) > len(
@@ -606,7 +670,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                    content = message.get("content")
+                    if content is not None and not isinstance(content, (list, str)):
+                        try:
+                            message["content"] = list(content)
+                        except TypeError:
+                            message["content"] = []
+
+                truncate_prompt_tokens = self.cfg.get("truncate_prompt_tokens")
+                if (
+                    truncate_prompt_tokens is not None
+                    and hasattr(request, "truncate_prompt_tokens")
+                    and request.truncate_prompt_tokens is None
+                ):
+                    request.truncate_prompt_tokens = truncate_prompt_tokens
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -656,6 +733,27 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         )
                     return res
 
+                # vLLM normalizes reasoning and tool-call message content during
+                # preprocessing.  Reuse that representation for the isolated
+                # prefix render, while removing NeMo-RL's token bookkeeping.
+                excluded_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for message in messages:
+                    if isinstance(message, dict):
+                        messages_for_replace_prefix_tokens.append(
+                            {
+                                key: deepcopy(value)
+                                for key, value in message.items()
+                                if key not in excluded_fields
+                            }
+                        )
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(message))
+
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
                     if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
@@ -666,11 +764,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens
                     )
+                    suffix_message_count = None
                 else:
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens[
                             : last_assistant_message_idx + 1
                         ]
+                    )
+                    suffix_message_count = (
+                        len(messages_for_replace_prefix_tokens)
+                        - last_assistant_message_idx
+                        - 1
                     )
 
                 modified_request = request.model_copy(
@@ -699,6 +803,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    suffix_message_count=suffix_message_count,
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
