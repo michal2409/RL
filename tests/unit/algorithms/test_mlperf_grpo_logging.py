@@ -161,3 +161,44 @@ def test_mlperf_grpo_logger_tracks_lifecycle_and_target() -> None:
         if method == "event" and kwargs.get("key") == "tracked_stats"
     ]
     assert {"reduced_train_loss": 0.2, "reward": 0.4, "grad_norm": 0.6} in tracked_stats
+
+
+def test_mlperf_final_eval_defers_run_stop_until_train_metrics() -> None:
+    config = _config()
+    fake = _FakeMLLogger()
+    logger = MLPerfGRPOLogger(config, mllogger=fake)
+    logger.log_init_stop_run_start()
+
+    final_step = config["grpo"]["max_num_steps"]
+    logger.start_eval(final_step)
+    logger.end_eval(final_step, {"accuracy": 0.5})
+
+    assert not logger.run_stopped
+    assert logger.pending_run_stop_status == "aborted"
+
+    logger.observe_metrics(
+        {"loss": 0.2, "reward": 0.4},
+        step=final_step,
+        prefix="train",
+    )
+    logger.finalize()
+
+    tracked_index = next(
+        index
+        for index, (method, kwargs) in enumerate(fake.calls)
+        if method == "event"
+        and kwargs.get("key") == "tracked_stats"
+        and kwargs.get("value") == {"reduced_train_loss": 0.2, "reward": 0.4}
+    )
+    run_stop_index = next(
+        index
+        for index, (method, kwargs) in enumerate(fake.calls)
+        if method == "end" and kwargs.get("key") == "run_stop"
+    )
+    assert tracked_index < run_stop_index
+    assert logger.run_stopped
+    assert logger.pending_run_stop_status is None
+    assert fake.calls[run_stop_index][1]["metadata"] == {
+        "samples_count": final_step * config["policy"]["train_global_batch_size"],
+        "status": "aborted",
+    }
