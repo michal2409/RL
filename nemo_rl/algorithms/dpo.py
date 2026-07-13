@@ -158,7 +158,7 @@ def setup(
     if policy_config["sequence_packing"]["enabled"]:
         assert not (
             policy_config["megatron_cfg"]["enabled"]
-            and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+            and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
         ), (
             "Linear CE fusion loss is not supported with sequence packing in DPO. "
             "The fusion path has not been validated with cu_seqlens-based logprob aggregation."
@@ -283,8 +283,8 @@ def setup(
 
     loss_fn = DPOLossFn(
         master_config.dpo,
-        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
+        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"],
     )
     print("  ✓ Model initialized")
 
@@ -733,7 +733,10 @@ def dpo_train(
                             train_dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
