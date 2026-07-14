@@ -49,8 +49,15 @@ grpo:
   seq_logprob_error_threshold: 2
   async_grpo:
     enabled: true
-    max_trajectory_age_steps: 1
-    in_flight_weight_updates: false
+    # PERF branch: collect one step ahead and refit without draining.
+    # Generation continues through weight updates (Magistral-style: in-flight
+    # requests finish on the old weights; new requests see invalidated prefix
+    # cache + new weights via the refit_policy_generation invalidation).
+    # Off-policy mixture is bounded by age<=2 and corrected by TIS (ratio cap
+    # 5 / floor 0.2). Convergence gate: 20-step val curve must track the ToT
+    # baseline (31.3/37.5/43.0/46.5 @ 0/5/10/15).
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -180,7 +187,9 @@ policy:
       # spanning NVL72 rack boundaries — fixed properly by --segment=8 +
       # cluster.segment_size=8. The reference branch runs with overlap on.
       overlap_grad_reduce: true
-      overlap_param_gather: false
+      # PERF branch: overlap distributed-optimizer param all-gather with
+      # forward compute (pure comm/compute overlap, no math change).
+      overlap_param_gather: true
       # Bug #16 fix: the per-bucket NaN grad check D2H-syncs inside the DDP
       # grad-ready hook and deadlocked every process's second train step at
       # this scale (see setup.py ddp config comment). NaN grads still surface
@@ -261,6 +270,11 @@ policy:
       # init path (verified: job 2295735 trained through it).
     checkpoint:
       async_strategy: mcore
+      # PERF branch (upstream feature from the ToT merge): background the
+      # 0.8 TB disk writes after D2H staging, and skip sharded-metadata
+      # recomputation after the first two saves (structure is constant).
+      async_save: true
+      ckpt_assume_constant_structure: true
     mtp_loss_scaling_factor: 0.0
     mtp_num_layers: 0
     mtp_use_repeated_layer: false
