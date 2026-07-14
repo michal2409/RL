@@ -187,9 +187,13 @@ policy:
       # spanning NVL72 rack boundaries — fixed properly by --segment=8 +
       # cluster.segment_size=8. The reference branch runs with overlap on.
       overlap_grad_reduce: true
-      # PERF branch: overlap distributed-optimizer param all-gather with
-      # forward compute (pure comm/compute overlap, no math change).
-      overlap_param_gather: true
+      # PERF branch: overlap_param_gather=true was tried and REVERTED — it
+      # raises peak memory during the first forward exactly when NCCL creates
+      # the MoE alltoall channels; 16 ranks died with "NCCL Error 1: unhandled
+      # cuda error" in token_dispatch (job 2374611, the historical
+      # channel-creation-OOM signature from 2269456). Not worth re-attempting
+      # without a memory-headroom analysis.
+      overlap_param_gather: false
       # Bug #16 fix: the per-bucket NaN grad check D2H-syncs inside the DDP
       # grad-ready hook and deadlocked every process's second train step at
       # this scale (see setup.py ddp config comment). NaN grads still surface
