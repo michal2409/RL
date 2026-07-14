@@ -4523,14 +4523,21 @@ def async_grpo_train(
                     if mlperf_logger is not None and mlperf_logger.target_reached:
                         return
 
-                        # Explicit GPU memory cleanup after validation in async mode
-                        import gc
+                    # Explicit GPU memory cleanup after validation in async mode
+                    import gc
 
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-                        # Resume trajectory collection after validation
-                        trajectory_collector.resume.remote()
+                    # Resume trajectory collection after validation. Without
+                    # this the collector's spawn loop waits forever on the
+                    # manual-pause event set at the val boundary: the run
+                    # trains exactly one more step off buffered trajectories
+                    # and then starves at 15/16 groups until walltime
+                    # (observed in grpo-tot-1 windows 1-2 when a merge
+                    # reconstruction left these lines unreachable behind the
+                    # target_reached return).
+                    trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
