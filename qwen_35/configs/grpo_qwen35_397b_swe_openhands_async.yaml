@@ -145,14 +145,19 @@ policy:
     moe_router_dtype: fp32
     moe_router_load_balancing_type: none
     moe_router_bias_update_rate: 0.0
-    moe_permute_fusion: false
+    # PERF-OPT: bitwise-neutral token permute/unpermute fusion (pure reindex);
+    # mcore defaults this off but our Triton GDN kernels prove Triton JIT works.
+    moe_permute_fusion: true
     moe_enable_deepep: false
     moe_token_dispatcher_type: alltoall
     moe_shared_expert_overlap: false
     moe_per_layer_logging: false
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
-    apply_rope_fusion: false
+    # PERF-OPT: fused RoPE on the 25% full-attention layers (near-bitwise,
+    # TE>=1.4). attention_output_gate=True only blocks fused_single_qkv_rope,
+    # not this flag.
+    apply_rope_fusion: true
     defer_fp32_logits: true
     optimizer:
       optimizer: adam
@@ -390,6 +395,14 @@ policy:
       # refit-then-reconvert flow lands (perf: trtllm kernels are faster).
       moe_backend: triton
       enable_chunked_prefill: true
+      # PERF-OPT: the KV cache caps each engine at ~53 full-length concurrent
+      # sequences ("Maximum concurrency for 65536 tokens per request: 53" in
+      # bringup); with ~16 engines the real per-engine decode batch lives in
+      # the ~16-53 range, so batches >64 are never hit. Setting max_num_seqs
+      # explicitly documents the ceiling; the finer cudagraph_capture_sizes
+      # below cut pad-up waste in that range (a batch of 40 previously padded
+      # up to the 64 graph). Refit-safe (no weight-layout change).
+      max_num_seqs: 64
       compilation_config:
         # Internal recommended vLLM config for this stack (2026-07-08):
         # mode 0 = NO torch.compile (sidesteps the inductor compile-stall
@@ -399,13 +412,21 @@ policy:
         # prefill path"). Inductor-specific knobs removed as unused.
         mode: 0
         cudagraph_mode: FULL_DECODE_ONLY
+        # Finer granularity in the real decode-batch range (~16-53/engine) to
+        # cut pad-up waste vs the old [.,16,32,64] (which padded 33-64 all up
+        # to 64). Full-decode graphs each cost capture time + memory; watch
+        # bringup at gpu_mem_util 0.80.
         cudagraph_capture_sizes:
         - 1
         - 2
         - 4
         - 8
         - 16
+        - 24
         - 32
+        - 40
+        - 48
+        - 56
         - 64
       generation_config: vllm
     colocated:
