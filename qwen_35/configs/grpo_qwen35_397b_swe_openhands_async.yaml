@@ -420,14 +420,17 @@ policy:
       # performance_mode is not an EngineArgs field in 0.20.0. Revisit both
       # if we move to the vLLM version the colleague measured on.
       compilation_config:
-        # Internal recommended vLLM config for this stack (2026-07-08):
-        # mode 0 = NO torch.compile (sidesteps the inductor compile-stall
-        # class that originally forced enforce_eager) while still capturing
-        # full CUDA graphs for the decode path only - prefill stays eager
-        # (FULL_DECODE_ONLY: "graph decode, do not graph the more variable
-        # prefill path"). Inductor-specific knobs removed as unused.
-        mode: 0
-        cudagraph_mode: FULL_DECODE_ONLY
+        # PERF-OPT (verified, grpo-perfopt-2 jobs 2388040/2389629): mode 3
+        # (torch.compile piecewise) + FULL_AND_PIECEWISE graphs cut steady
+        # median train_step_time 306s -> 253s (-17%) via exposed_generation
+        # ~177-192s -> ~144s, with val ABOVE the perf-1 baseline at every
+        # point (26.6/36.7/49.6/58.2/63.7 vs 31.6/32.0/46.9/56.3/57.8).
+        # 20 steps + ~20 in-flight refits, zero engine errors. CAVEAT: mode 3
+        # re-enables the inductor compile-stall class that originally forced
+        # mode 0 - it did not fire in this trial, but keep a bringup watcher;
+        # fallback is mode 0 + FULL_DECODE_ONLY (306s behavior).
+        mode: 3
+        cudagraph_mode: FULL_AND_PIECEWISE
         # Finer granularity in the real decode-batch range (~16-53/engine) to
         # cut pad-up waste vs the old [.,16,32,64] (which padded 33-64 all up
         # to 64). Full-decode graphs each cost capture time + memory; watch
