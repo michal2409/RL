@@ -154,10 +154,12 @@ policy:
     moe_per_layer_logging: false
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
-    # PERF-OPT: fused RoPE on the 25% full-attention layers (near-bitwise,
-    # TE>=1.4). attention_output_gate=True only blocks fused_single_qkv_rope,
-    # not this flag.
-    apply_rope_fusion: true
+    # Must stay false for Qwen3-VL/Qwen3.5-VL: modelling_qwen3_vl/rope.py
+    # hard-asserts (per-token absolute positional frequencies, incompatible
+    # with TE fused RoPE; fused dispatch is bypassed anyway so true buys
+    # nothing). Tried true in perf-opt Round 1 - killed job 2385966 on the
+    # first training forward across all ranks.
+    apply_rope_fusion: false
     defer_fp32_logits: true
     optimizer:
       optimizer: adam
