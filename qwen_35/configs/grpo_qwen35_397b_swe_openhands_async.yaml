@@ -403,6 +403,20 @@ policy:
       # below cut pad-up waste in that range (a batch of 40 previously padded
       # up to the 64 graph). Refit-safe (no weight-layout change).
       max_num_seqs: 64
+      # PERF-OPT (colleague-validated, measured speedup): raise the chunked-
+      # prefill budget from the vLLM default 2048 to 16384. Agent prompts are
+      # 22-29k tokens; at 2048 a full prompt was ~14 sequential prefill chunks
+      # that fragment scheduling and interleave poorly with decode. 16k = ~2
+      # chunks. Pure scheduler knob (no numerics / refit impact); larger token
+      # buffer costs memory, watch bringup at gpu_mem_util 0.80. Allow 2
+      # concurrent (long-)partial prefills so prefills don't serialize.
+      max_num_batched_tokens: 16384
+      max_num_partial_prefills: 2
+      max_long_partial_prefills: 2
+      # NOTE: colleague also suggested `performance_mode: throughput` — omitted:
+      # not a field in our pinned vLLM 0.20.0 EngineArgs (absent from the
+      # resolved-config dump); passing it would TypeError at engine init.
+      # Revisit if we confirm the vLLM version they measured on.
       compilation_config:
         # Internal recommended vLLM config for this stack (2026-07-08):
         # mode 0 = NO torch.compile (sidesteps the inductor compile-stall
