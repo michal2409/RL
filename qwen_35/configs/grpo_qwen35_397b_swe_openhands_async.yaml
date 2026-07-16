@@ -201,11 +201,6 @@ policy:
       # channel-creation-OOM signature from 2269456). Not worth re-attempting
       # without a memory-headroom analysis.
       overlap_param_gather: false
-      # Bug #16 fix: the per-bucket NaN grad check D2H-syncs inside the DDP
-      # grad-ready hook and deadlocked every process's second train step at
-      # this scale (see setup.py ddp config comment). NaN grads still surface
-      # via the global grad-norm in the optimizer.
-      check_for_nan_in_grad: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: optim_grads_params
     # Memory headroom for the training step. Job 2269463 (64-GPU shape) OOM'd
@@ -241,31 +236,6 @@ policy:
       # step 2 (SYSTEM_ERROR, no python traceback). Fault handler prints a
       # traceback on SIGSEGV/SIGABRT so the next occurrence is attributable.
       PYTHONFAULTHANDLER: "1"
-      # NCCL flight-recorder dump target on the mounted /logs dir (per-rank
-      # suffix appended) so timeout post-mortems survive job teardown.
-      TORCH_NCCL_DEBUG_INFO_TEMP_FILE: "/logs/nccl_trace"
-      # The flight recorder only records/dumps when the trace buffer is
-      # enabled at process start; without these the watchdog's "attempting to
-      # dump debug info" wrote nothing (job 2289258 step-2 deadlock).
-      TORCH_NCCL_TRACE_BUFFER_SIZE: "2000"
-      TORCH_NCCL_DUMP_ON_TIMEOUT: "1"
-      # torch 2.11 renamed the flight-recorder vars to TORCH_FR_*; job
-      # 2291300's watchdog "attempted to dump" with the legacy names set and
-      # wrote nothing. Set both families.
-      TORCH_FR_BUFFER_SIZE: "2000"
-      TORCH_FR_DUMP_TEMP_FILE: "/logs/nccl_trace"
-      # Fail fast on the step-boundary deadlock (bug #16): 60 min of waiting
-      # provably never unsticks it (jobs 2289258/2291300) and burns half a 2h
-      # window before the watchdog dumps. 30 min still clears legitimate gaps
-      # (741G checkpoint resume-load ~10-15 min).
-      NRL_NCCL_TIMEOUT_MINUTES: "30"
-      # Bug #16 transport-layer test: flight recorder (job 2294872) shows one
-      # rank per EP group COMPLETING an alltoall (sent+received all) while
-      # its 31 peers never finish the same op — peers' mutual transfers
-      # wedged. Code-level fixes (NaN check, grad-reduce overlap) changed
-      # nothing; suspect NVLS/multicast interplay under steady-state
-      # alltoall+p2p+SP traffic. Disable NVLS to discriminate.
-      NCCL_NVLS_ENABLE: "0"
       # Bug #16 test #4: NCCL_CUMEM_ENABLE=0 was INFEASIBLE - bringup itself
       # hung quietly for 2h during megatron worker init/checkpoint load (job
       # 2296607; rendezvous-phase hang, outside any watchdog). Do not disable
@@ -277,8 +247,8 @@ policy:
       # init (127/128 ranks blocked in init_nccl_communicator; same
       # failure explains the NCCL_CUMEM_ENABLE=0 bringup hang). Comm-wide
       # NCCL knobs must be applied symmetrically (launcher/ray.sub level)
-      # or not at all. NVLS=0 above is safe: it does not affect that
-      # init path (verified: job 2295735 trained through it).
+      # or not at all. (NCCL_NVLS_ENABLE=0 is not set here: NeMo-RL itself
+      # sets it for non-colocated cross-node model parallelism, issue #1352.)
     checkpoint:
       async_strategy: mcore
       # PERF branch (upstream feature from the ToT merge): background the
