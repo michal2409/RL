@@ -420,12 +420,6 @@ class MegatronConfig(TypedDict):
     first_last_layers_bf16: NotRequired[bool]
     num_layers_at_start_in_bf16: NotRequired[int]
     num_layers_at_end_in_bf16: NotRequired[int]
-    # When True, uses chunked linear cross-entropy fusion loss to compute loss
-    # directly from hidden states, avoiding materialization of the full
-    # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
-    # GPU memory, extending the maximum trainable sequence length (e.g. from <65K
-    # to >100K tokens). Only applicable to SFT with NLLLoss.
-    use_linear_ce_fusion_loss: NotRequired[bool]
     # When True, computes per-token logprobs with a chunked linear cross-entropy
     # fusion kernel directly from hidden states, avoiding materialization of the
     # full [batch, seq_len, vocab_size] logit tensor. This significantly reduces

@@ -487,8 +487,7 @@ class VllmInternalWorkerExtension:
 
         except Exception as e:
             print(
-                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}.\n"
-                f"{traceback.format_exc()}"
+                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
             )
             return False
 
