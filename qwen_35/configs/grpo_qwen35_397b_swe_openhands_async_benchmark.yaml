@@ -1,0 +1,33 @@
+# Qwen 3.5 SWE/OpenHands benchmark wrapper.
+#
+# This inherits the standard Qwen 3.5 config and changes only benchmark-shape
+# knobs. Keep runtime paths, node counts, and site-specific values in the
+# launcher environment or explicit Hydra overrides.
+
+defaults: grpo_qwen35_397b_swe_openhands_async.yaml
+
+grpo:
+  num_prompts_per_step: ${oc.decode:${oc.env:NUM_PROMPTS_PER_STEP,16}}
+  num_generations_per_prompt: ${oc.decode:${oc.env:NUM_GENERATIONS_PER_PROMPT,16}}
+  max_num_steps: 30
+  val_period: 0
+  val_at_start: false
+  val_at_end: true
+
+policy:
+  megatron_cfg:
+    optimizer:
+      # 1.0e-6 to match the reference branch (arigazzi/mlperf-training-
+      # qwen35-main); we previously ran 2.5e-6 and saw faster policy-KL
+      # divergence + greedy-val collapse (grpo-nocache-1: val 28.9%->5.5%
+      # by step 5 with 145/256 masked seqs).
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+    scheduler:
+      lr_warmup_iters: 0
+
+# NOTE: do NOT re-override swe_agents_val swebench_agent_timeout here — the
+# parent recipe sets it to 1200 deliberately (val engines were contended /
+# degenerate greedy decodes push episodes past 600s; see parent yaml comment).
+# A 600 override here silently shadowed that fix for all benchmark runs
+# through grpo-nocache-1 window 3.

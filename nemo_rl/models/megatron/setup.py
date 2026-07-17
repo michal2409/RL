@@ -832,6 +832,20 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
+    # Optional first/last-layer BF16 precision overrides (used by FP8 recipes to
+    # keep boundary layers in BF16).
+    if "first_last_layers_bf16" in config["megatron_cfg"]:
+        model_cfg.first_last_layers_bf16 = config["megatron_cfg"][
+            "first_last_layers_bf16"
+        ]
+    if "num_layers_at_start_in_bf16" in config["megatron_cfg"]:
+        model_cfg.num_layers_at_start_in_bf16 = config["megatron_cfg"][
+            "num_layers_at_start_in_bf16"
+        ]
+    if "num_layers_at_end_in_bf16" in config["megatron_cfg"]:
+        model_cfg.num_layers_at_end_in_bf16 = config["megatron_cfg"][
+            "num_layers_at_end_in_bf16"
+        ]
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
@@ -1019,6 +1033,29 @@ def _validate_dtype_config(
         )
 
 
+def _normalize_optimizer_dtypes(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Convert serializable dtype names to torch.dtype at the MCore boundary."""
+    normalized = dict(optimizer_cfg)
+    dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    for key in (
+        "main_params_dtype",
+        "main_grads_dtype",
+        "exp_avg_dtype",
+        "exp_avg_sq_dtype",
+    ):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            normalized[key] = dtype_map[value.lower()]
+    return normalized
+
+
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -1040,7 +1077,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_normalize_optimizer_dtypes(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }

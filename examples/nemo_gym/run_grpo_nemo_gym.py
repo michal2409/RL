@@ -15,7 +15,6 @@
 import argparse
 import os
 import pprint
-import time
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
@@ -38,6 +37,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     setup,
 )
+from nemo_rl.algorithms.mlperf_grpo_logging import create_mlperf_logger
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -51,8 +51,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.logger import get_next_experiment_dir
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -118,10 +117,7 @@ def collect_trajectories(
 
 def main() -> None:
     """Main entry point."""
-    main_start = time.perf_counter()
-    log_container_init_timing()
-    rl_init_timer = Timer(context={"worker": "driver"})
-
+    # Parse arguments
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
@@ -131,17 +127,21 @@ def main() -> None:
             "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml",
         )
 
-    with rl_init_timer.time("config"):
-        config = load_config(args.config)
-        print(f"Loaded configuration from: {args.config}")
+    config = load_config(args.config)
+    print(f"Loaded configuration from: {args.config}")
 
-        if overrides:
-            print(f"Overrides: {overrides}")
-            config = parse_hydra_overrides(config, overrides)
+    if overrides:
+        print(f"Overrides: {overrides}")
+        config = parse_hydra_overrides(config, overrides)
 
-        config = OmegaConf.to_container(config, resolve=True)
-        config = MasterConfig(**config)
-        print("Applied CLI overrides")
+    config = OmegaConf.to_container(config, resolve=True)
+    # create_mlperf_logger expects the raw config mapping; call it before the
+    # pydantic MasterConfig conversion.
+    mlperf_logger = create_mlperf_logger(config)
+    if mlperf_logger is not None:
+        mlperf_logger.log_init_start()
+    config = MasterConfig(**config)
+    print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
@@ -151,27 +151,26 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    with rl_init_timer.time("tokenizer"):
-        tokenizer = get_tokenizer(config.policy["tokenizer"])
-        assert config.policy["generation"] is not None, (
-            "A generation config is required for GRPO"
-        )
-        config.policy["generation"] = configure_generation_config(
-            config.policy["generation"], tokenizer
-        )
+    # setup tokenizer
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    assert config.policy["generation"] is not None, (
+        "A generation config is required for GRPO"
+    )
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"], tokenizer
+    )
 
-        # NeMo-Gym specific config setup.
-        setup_nemo_gym_config(config, tokenizer)
+    # NeMo-Gym specific config setup.
+    setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_nemo_gym(config)
 
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
-    with rl_init_timer.time("data"):
-        print("\n▶ Setting up data...")
-        train_dataset, val_dataset = setup_response_data(
-            tokenizer, config.data, env_configs=None
-        )
+    print("\n▶ Setting up data...")
+    train_dataset, val_dataset = setup_response_data(
+        tokenizer, config.data, env_configs=None
+    )
 
     # Validation dataset config setup.
     if config.grpo["max_val_samples"] is not None:
@@ -190,12 +189,14 @@ The validation set you pass in will directly be used for validation with no addi
         config.grpo["max_val_samples"] = len(val_dataset)
         config.grpo["val_batch_size"] = config.grpo["max_val_samples"]
 
+    if mlperf_logger is not None:
+        mlperf_logger.log_hyperparams(train_dataset, val_dataset)
+
     # Print config
     print("Final config:")
     pprint.pprint(config)
 
-    with rl_init_timer.time("ray_connect"):
-        init_ray()
+    init_ray()
 
     # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
     # before setup() so it is not forwarded into NeMo-Gym's global config (the
@@ -204,31 +205,21 @@ The validation set you pass in will directly be used for validation with no addi
         config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
 
-    with rl_init_timer.time("setup"):
-        (
-            policy,
-            policy_generation,
-            nemo_gym,
-            cluster,
-            dataloader,
-            val_dataloader,
-            loss_fn,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-            teacher_worker_groups,
-            alias_to_group_alias,
-        ) = setup(config, tokenizer, train_dataset, val_dataset)
-
-    rl_init_timer.record("total", time.perf_counter() - main_start)
-    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
-    print("\n" + "=" * 60)
-    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
-    for label, value in sorted(rl_init_metrics.items()):
-        if isinstance(value, (int, float)):
-            print(f"  {label}: {value:.1f}s")
-    print("=" * 60 + "\n", flush=True)
+    (
+        policy,
+        policy_generation,
+        nemo_gym,
+        cluster,
+        dataloader,
+        val_dataloader,
+        loss_fn,
+        logger,
+        checkpointer,
+        grpo_state,
+        master_config,
+        teacher_worker_groups,
+        alias_to_group_alias,
+    ) = setup(config, tokenizer, train_dataset, val_dataset)
 
     # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
     # Bind task_to_env and val_task_to_env for the nemo_gym env.
@@ -237,15 +228,21 @@ The validation set you pass in will directly be used for validation with no addi
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:
-        collect_trajectories(
-            policy=policy,
-            policy_generation=policy_generation,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            master_config=master_config,
-        )
+        if mlperf_logger is not None:
+            mlperf_logger.log_init_stop_run_start()
+        try:
+            collect_trajectories(
+                policy=policy,
+                policy_generation=policy_generation,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                master_config=master_config,
+            )
+        finally:
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
     # Check if async mode is enabled
     elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
@@ -282,41 +279,53 @@ The validation set you pass in will directly be used for validation with no addi
 
         async_config = config.grpo["async_grpo"]
         # Run async GRPO training
-        async_grpo_train(
-            policy=policy,
-            policy_generation=policy_generation,
-            dataloader=dataloader,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            loss_fn=loss_fn,
-            task_to_env=task_to_env,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            checkpointer=checkpointer,
-            grpo_save_state=grpo_state,
-            master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
-            teacher_worker_groups=teacher_worker_groups,
-            alias_to_group_alias=alias_to_group_alias,
-        )
+        try:
+            async_grpo_train(
+                policy=policy,
+                policy_generation=policy_generation,
+                dataloader=dataloader,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                loss_fn=loss_fn,
+                task_to_env=task_to_env,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                checkpointer=checkpointer,
+                grpo_save_state=grpo_state,
+                master_config=master_config,
+                max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=alias_to_group_alias,
+                mlperf_logger=mlperf_logger,
+            )
+        except Exception:
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
+            raise
     else:
         print("🚀 Running synchronous GRPO training")
 
         # Run standard GRPO training
-        grpo_train(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-        )
+        try:
+            grpo_train(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                mlperf_logger=mlperf_logger,
+            )
+        except Exception:
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
+            raise
 
 
 if __name__ == "__main__":

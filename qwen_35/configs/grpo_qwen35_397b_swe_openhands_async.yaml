@@ -1,0 +1,501 @@
+# Qwen 3.5 SWE/OpenHands async GRPO recipe.
+#
+# Standalone version of the Qwen 3.5 recipe. It intentionally does not inherit
+# from another model recipe, so Qwen 3.5 jobs do not depend on model-family
+# compatibility defaults or comments. Runtime paths, node counts, and experiment
+# names are provided by the Qwen 3.5 launcher environment or explicit Hydra
+# overrides.
+
+grpo:
+  # Default seed so the config parses standalone; the launcher overrides it
+  # with ++grpo.seed=<random>.
+  seed: 42
+  max_num_epochs: 100
+  # Keep rollout shape out of launcher filenames; run_and_time.sh can also
+  # pass NUM_PROMPTS_PER_STEP and NUM_GENERATIONS_PER_PROMPT as overrides.
+  num_prompts_per_step: ${oc.decode:${oc.env:NUM_PROMPTS_PER_STEP,32}}
+  num_generations_per_prompt: ${oc.decode:${oc.env:NUM_GENERATIONS_PER_PROMPT,16}}
+  max_rollout_turns: 1
+  max_num_steps: 8
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: true
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: null
+  validation_generation:
+    temperature: 0.0
+    top_p: 1.0
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  adv_estimator:
+    name: grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  async_grpo:
+    enabled: true
+    # PERF (validated grpo-perf-1/perfopt-2/ab3): collect one step ahead and
+    # refit without draining; off-policy mixture bounded by age<=2 and
+    # corrected by TIS.
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+loss_fn:
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+checkpointing:
+  # Enabled so convergence runs can chain across SLURM walltime windows:
+  # window A trains steps 1..N and saves, window B (same EXP_NAME ->
+  # same mounted /checkpoint dir) auto-resumes from the latest step_* and
+  # trains N+1..2N (grpo.max_num_steps is an ABSOLUTE cumulative count).
+  # NOTE: with val_period=0 mid-run checkpoints carry no val metric, so the
+  # metric_name ranking is inert; keep_top_k large so the LATEST checkpoint
+  # is never pruned away (resume picks the highest step dir, not the best).
+  # save_optimizer=false keeps saves at ~0.8 TB (bf16 weights only) at the
+  # cost of Adam moments resetting at window boundaries - acceptable for
+  # evidence runs; set true (~5.5 TB/save) for bit-clean continuation.
+  enabled: true
+  checkpoint_dir: results/grpo-qwen35-397b-swe-openhands
+  metric_name: val:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 100
+  save_period: 5
+  checkpoint_must_save_by: null
+  save_optimizer: false
+policy:
+  model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
+  tokenizer:
+    name: ${oc.env:CONTAINER_HF_CKPT_PATH}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 65536
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    _v2: false
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+  megatron_cfg:
+    enabled: true
+    # Force FlashAttention-2: TE's auto selection fell back to unfused on this
+    # stack (cuDNN fused has no hdim-256 support on sm10.3 at all), which
+    # materialized [B,H,S,S] scores (98.45 GiB at S=65536) and OOM'd every
+    # training step. flash-attn 2.8.1 handles hdim 256 on GB300 once TE's
+    # arch allowlist admits sm10.3 (patched te_dpa_utils.py bind-mounted by
+    # the launcher; verified fwd+bwd in preflight job 2274314).
+    attention_backend: flash
+    empty_unused_memory_level: 1
+    train_iters: 100000
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: ${oc.decode:${oc.env:TP,4}}
+    expert_tensor_parallel_size: ${oc.decode:${oc.env:ETP,1}}
+    expert_model_parallel_size: ${oc.decode:${oc.env:EP,32}}
+    pipeline_model_parallel_size: ${oc.decode:${oc.env:PP,1}}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    # fp32 to match the reference branch (arigazzi/mlperf-training-qwen35-main)
+    # for the aligned-config convergence comparison (was fp64).
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    # PERF-OPT (validated): bitwise-neutral token permute/unpermute fusion.
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    optimizer:
+      optimizer: adam
+      lr: 5.0e-06
+      min_lr: 4.999e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: ${policy.max_grad_norm}
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 100000
+      lr_warmup_iters: 0
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      # Re-enabled (reference-branch alignment): was disabled as a bug #16
+      # mitigation, but the root cause turned out to be EP alltoall groups
+      # spanning NVL72 rack boundaries — fixed properly by --segment=8 +
+      # cluster.segment_size=8. The reference branch runs with overlap on.
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    # Memory headroom for the training step. Job 2269463 (64-GPU shape) OOM'd
+    # on a ~60.76 GiB fp32 transient in the last-PP-stage backward; job 2269456
+    # (128-GPU benchmark shape, max_split_size_mb:512) then died at the first
+    # send_forward_recv_backward with ncclUnhandledCudaError and no Python OOM
+    # anywhere - the signature of NCCL's own cudaMalloc failing at peak memory
+    # when the reverse-direction p2p channels are first created.
+    # expandable_segments defragments the torch pool so those non-torch
+    # allocations can succeed. Note: may slow refit weight transfer (docstring
+    # in _clear_fp8_caches claims ~5x on the IPC path) - measure and revisit.
+    # NCCL_DEBUG=WARN surfaces the underlying CUDA error code if it recurs.
+    env_vars:
+      # expandable_segments is LOAD-BEARING for bringup: without it NCCL's
+      # own cudaMalloc for reverse-direction p2p channels fails at first
+      # send/recv (Cuda failure 2 'out of memory' in _end_coalescing; jobs
+      # 2269456, 2296417, 2296489 - the max_split_size_mb:512 variant died
+      # identically twice). Keep it; test the NCCL-buffer interaction via
+      # NCCL_CUMEM_ENABLE below instead.
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      NCCL_DEBUG: "WARN"
+      # Jobs 2269608/2272089 OOM'd in TE's UNFUSED dot-product-attention
+      # fallback (softmax.py forward_torch_softmax), which materializes the
+      # full [B,H,S,S] score matrix (S=65536 -> 24.85-98.45 GiB allocs).
+      # attention_backend: fused (below) makes mcore set the NVTE_*_ATTN env
+      # vars itself (raw NVTE_UNFUSED_ATTN=0 trips mcore's consistency assert,
+      # job 2272954). Nondeterministic cuDNN attention algorithms are the most
+      # common fused-attention rejection cause; debug flags log selection.
+      NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+      NVTE_DEBUG: "1"
+      NVTE_DEBUG_LEVEL: "2"
+      # Job 2274348 lost 3 worker processes on 3 nodes simultaneously during
+      # step 2 (SYSTEM_ERROR, no python traceback). Fault handler prints a
+      # traceback on SIGSEGV/SIGABRT so the next occurrence is attributable.
+      PYTHONFAULTHANDLER: "1"
+      # (Removed after removal-A/B verification on the validated stack:
+      # flight-recorder env + NRL_NCCL_TIMEOUT_MINUTES + NCCL_NVLS_ENABLE=0.
+      # NVLS is disabled by NeMo-RL itself for non-colocated cross-node MP,
+      # issue #1352; the watchdog/nan-check knobs showed no failure
+      # signatures across two 20-step runs without them.)
+      # Bug #16 test #4: NCCL_CUMEM_ENABLE=0 was INFEASIBLE - bringup itself
+      # hung quietly for 2h during megatron worker init/checkpoint load (job
+      # 2296607; rendezvous-phase hang, outside any watchdog). Do not disable
+      # cuMem on this stack.
+      # Bug #16 test #5: NCCL_PROTO=Simple was ALSO infeasible via this
+      # env block (job 2300140): these env_vars reach only the megatron
+      # workers, but the refit collective group spans megatron AND vLLM
+      # ranks - asymmetric NCCL env inside one communicator wedges its
+      # init (127/128 ranks blocked in init_nccl_communicator; same
+      # failure explains the NCCL_CUMEM_ENABLE=0 bringup hang). Comm-wide
+      # NCCL knobs must be applied symmetrically (launcher/ray.sub level)
+      # or not at all.
+    checkpoint:
+      async_strategy: mcore
+      # PERF (validated): background the disk writes after D2H staging and
+      # skip sharded-metadata revalidation across same-structure saves.
+      async_save: true
+      ckpt_assume_constant_structure: true
+    mtp_loss_scaling_factor: 0.0
+    mtp_num_layers: 0
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    moe_flex_dispatcher_backend: alltoall
+    moe_hybridep_num_sms: 32
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    # Matches the qwen3-235B SWE sibling recipe on main. Without packing the
+    # megatron path pads every sequence in the batch to one global
+    # padded_seq_length; a single 65k rollout then makes ~95% of all tokens
+    # pad tokens, which all route to the SAME top-10 experts (frozen router,
+    # no load balancing) and blow up one EP rank's alltoall receive/GEMM
+    # buffers (~135 GiB transient + failed 24.85 GiB alloc in job 2269608 on
+    # stage-0 ranks). Packing keeps microbatches at real tokens.
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length},${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 32
+  max_grad_norm: 1.0
+  offload_optimizer_for_logprob: false
+  optimizer: null
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+  generation:
+    backend: vllm
+    max_new_tokens: 65536
+    # Left-truncate over-long HTTP chat prompts instead of erroring; clamped
+    # server-side so input + output <= max_model_len.
+    truncate_prompt_tokens: 65535
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      kv_cache_dtype: auto
+      precision: ${policy.precision}
+      tensor_parallel_size: ${oc.decode:${oc.env:GTP,8}}
+      pipeline_parallel_size: ${oc.decode:${oc.env:GPP,1}}
+      expert_parallel_size: ${oc.decode:${oc.env:GEP,8}}
+      # Keep the async generation pool at the requested 90% utilization.
+      gpu_memory_utilization: 0.80
+      max_model_len: 65536
+      # Engines kept dying at first traffic: a TP rank stalls >600s in a
+      # first-hit inductor dynamic-shape compile (persists even with
+      # combo-kernel benchmarking off), the peers' logits allgather trips the
+      # NCCL watchdog, and the whole engine dies (jobs 2269608/2272089/
+      # 2273194; vLLM re-arms TORCH_NCCL_ASYNC_ERROR_HANDLING so the launcher
+      # env cannot relax it). Eager mode removed runtime compilation
+      # entirely during bringup. RE-ENABLED compiled engines 2026-07-08:
+      # eager decode latency starved the SWE agents (68% of train rollouts
+      # hit the 600s agent timeout with a median 517s spent in model calls
+      # -> zero patches -> all-zero advantages, no learning signal). The
+      # original compile-stall deaths are now mitigated by
+      # RAY_CGRAPH_get_timeout=1800, combo-kernel benchmarking off, and the
+      # gym 120s retry cap (an engine death back-fills instead of wedging).
+      enforce_eager: false
+      # Prefix caching ON: refit_policy_generation now invalidates the cache
+      # on every refit path (96a0226d), closing the stale-KV lifecycle gap
+      # that previously forced this off. For 25-30-turn SWE agent episodes
+      # this is a ~6x latency win (each turn no longer re-prefills the full
+      # 22-29k-token conversation). Validated in grpo-cachetest-1
+      # (2354981): masking 2/256 with caching on, step reward identical to
+      # the caching-off twin, val 56.2% resolved with 0% timeouts.
+      enable_prefix_caching: true
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_xml
+        reasoning_parser: qwen3
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      # Keep MoE weights in the standard [E, 2I, H]/[E, H, I] layout. The
+      # default (auto -> FlashInfer TRTLLM on Blackwell) converts w13/w2 into a
+      # swizzled block layout after load (swap to [w3;w1] + 4D blocking), which
+      # breaks every subsequent weight refit: the stock FusedMoE weight_loader
+      # raises 'shard_dim=0 is not a valid data dimension for a 3D tensor'
+      # against the converted params, and correct values could not be written
+      # into the swizzled layout anyway. Triton keeps kernel format == storage
+      # format, so per-step refits load correctly. Revisit if a
+      # refit-then-reconvert flow lands (perf: trtllm kernels are faster).
+      moe_backend: triton
+      enable_chunked_prefill: true
+      # PERF (validated): explicit decode-batch ceiling + 16k chunked-prefill
+      # budget (agent prompts are 22-29k tokens; the vLLM default 2048 splits
+      # a prompt into ~14 sequential chunks). NOTE vLLM 0.20 rejects
+      # max_num_partial_prefills>1 ("Concurrent Partial Prefill") - do not add.
+      max_num_seqs: 64
+      max_num_batched_tokens: 16384
+      compilation_config:
+        # PERF (validated grpo-perfopt-2: steady step 306s->253s, val above
+        # baseline; zero engine errors through bringup compile + in-flight
+        # refits): torch.compile piecewise + full+piecewise CUDA graphs.
+        # Fallback if inductor-compile stalls kill engines at bringup:
+        # mode 0 + FULL_DECODE_ONLY.
+        mode: 3
+        cudagraph_mode: FULL_AND_PIECEWISE
+        # Finer granularity in the real decode-batch range to cut pad-up
+        # waste (a batch of 40 previously padded up to the 64 graph).
+        cudagraph_capture_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 24
+        - 32
+        - 40
+        - 48
+        - 56
+        - 64
+      generation_config: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 32
+    mcore_generation_config:
+      buffer_size_gb: 8
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
+  validation:
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    use_absolute_ip: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          # Must match the OpenHands commit baked into the image
+          # (docker/mlperf/Dockerfile.gym_qwen35 AGENT_FRAMEWORK_COMMIT). The gym
+          # default (25bacbc6...) does not exist in the baked nv-OpenHands
+          # checkout, and run_infer.sh aborts on any commit switch because the
+          # runtime copies prompt templates into the checkout (dirty tree).
+          agent_framework_commit: 0d766ad06b2be64a42e6f0175b9ebcc4a06599d9
+          agent_prompt_overrides:
+          - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
+            system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
+            agent_cls: CodeActAgent
+            diversify_tool_names: false
+          agent_max_turns: 30
+          # 1200s + concurrency 256 to match the reference branch (was
+          # 600/128). At 600s the train side timeout-censored slow episodes
+          # (10.9% at step 0 rising to >60% as greedy decode degenerated).
+          swebench_agent_timeout: 1200
+          swebench_tests_timeout: 300
+          concurrency: 256
+          base_results_dir: /logs/nemo_gym/swe_agents_train
+          dataset_path: ${data.train.data_path}
+          # Fallback list: entries are tried in order per instance. Covers both
+          # SIF layouts: <sif_dir>/r2egym/<id>.sif (sif_dir is the parent dir)
+          # and <sif_dir>/<id>.sif (sif_dir is the r2egym dir itself).
+          container_formatter:
+          - ${sif_dir}/r2egym/{instance_id}.sif
+          - ${sif_dir}/{instance_id}.sif
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_framework_commit: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_framework_commit}
+          agent_max_turns: 30
+          # Val protocol fix (grpo-aligned-1 evidence): at concurrency 256 the
+          # per-episode model-call time ballooned to median 843-1080s and
+          # 28-43% of val episodes STILL timed out at 1200s — val accuracy
+          # (3.5-15.2%) measured the censoring, not the policy (train solve
+          # 67% at the same steps). Val is a measurement, not a throughput
+          # workload: run it at low contention (128 ≈ 8 episodes/engine, the
+          # healthiest observed profile: 375s median, 10.9% timeouts) with the
+          # gym-default 1800s budget as headroom for longer late-training
+          # completions.
+          swebench_agent_timeout: 1800
+          swebench_tests_timeout: 180
+          concurrency: 128
+          base_results_dir: /logs/nemo_gym/swe_agents_val
+          dataset_path: ${data.validation.data_path}
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          chat_template_kwargs:
+            enable_thinking: false
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: grpo-dev
+    name: grpo-qwen35-397b-swe-openhands
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 4
+  num_nodes: 64
+token_ids:
+  eos: 248046
+  think_open: 248068
+  think_close: 248069
+penalize_duplicated_reasoning: false
+penalize_empty_final_answer: false
+penalize_eos_token: false
+penalize_malformed_think_tag: false
