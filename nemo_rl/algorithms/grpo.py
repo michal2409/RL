@@ -179,6 +179,17 @@ class AdvEstimatorConfig(TypedDict):
     minus_baseline: NotRequired[bool]
 
 
+class ValidationGenerationConfig(TypedDict):
+    """Optional validation-only sampling parameters.
+
+    These fields override policy.generation only while validation rollouts are
+    being generated. Training rollouts continue to use policy.generation.
+    """
+
+    temperature: float
+    top_p: float
+
+
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
     """Optional token IDs for reward penalties."""
 
@@ -239,6 +250,7 @@ class GRPOConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
+    validation_generation: NotRequired[ValidationGenerationConfig | None]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -368,6 +380,10 @@ def setup(
     )
     if generation_config["backend"] == "vllm":
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+
+    validation_generation_config = grpo_config.get("validation_generation", None)
+    if validation_generation_config is not None:
+        generation_config["_validation_generation"] = dict(validation_generation_config)
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -1622,6 +1638,25 @@ def scale_rewards(
     return repeated_batch
 
 
+def _stable_group_ids(prompt_ids_for_adv, num_generations_per_prompt):
+    """Stable per-prompt grouping key for GRPO advantage computation.
+
+    GRPO groups samples by prompt (torch.unique) to compute the leave-one-out baseline. The default
+    key is the rendered prompt token-ids, but for agentic gym rollouts each generation's first-turn
+    prompt tokenizes slightly differently (observed on Qwen3-Instruct + hermes: every generation
+    becomes its own singleton group -> leave-one-out baseline == reward -> advantage == 0 -> zero
+    gradient; Exp 26). The training batch is laid out as contiguous num_gen blocks per prompt
+    (async: BatchedDataDict.from_batches of per-prompt groups; sync: repeat_interleave), so the
+    correct, model-agnostic group id is positional: index // num_gen. Falls back to the original
+    token-id grouping if the batch is not an exact multiple of num_gen (e.g. dynamic sampling).
+    """
+    n = int(prompt_ids_for_adv.shape[0])
+    g = int(num_generations_per_prompt)
+    if g <= 0 or n % g != 0:
+        return prompt_ids_for_adv
+    return (torch.arange(n, device=prompt_ids_for_adv.device) // g).unsqueeze(1)
+
+
 def extract_initial_prompt_messages(
     message_logs: list,
     original_prompt_lengths: torch.Tensor,
@@ -2242,6 +2277,23 @@ def refit_policy_generation(
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
+    # With prefix caching enabled, vLLM's cached blocks are keyed only by
+    # token ids, so blocks prefilled under the OLD weights would be silently
+    # reused under the new ones (stale KV -> genuine train/gen logprob
+    # divergence on every rollout sharing a cached prefix). Invalidate on
+    # every refit, on every refit path (main loop, pre-validation, sync).
+    # Backends without reusable caches inherit the no-op interface default.
+    generation_cfg = getattr(policy_generation, "cfg", None) or {}
+    vllm_cfg = generation_cfg.get("vllm_cfg") or {}
+    if vllm_cfg.get("enable_prefix_caching"):
+        if not policy_generation.invalidate_kv_cache():
+            raise RuntimeError(
+                "❌ Error: prefix caching is enabled but invalidating the "
+                "vLLM prefix/KV cache after refit failed; continuing would "
+                "sample rollouts against stale KV computed under the "
+                "pre-refit weights."
+            )
+
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.resume_after_refit()
 
@@ -2506,7 +2558,6 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
-
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
             "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
@@ -2703,7 +2754,6 @@ def grpo_train(
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
-
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo["reward_scaling"]
                 )
@@ -2987,8 +3037,17 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    # Positional grouping is only needed for agentic gym rollouts,
+                    # where per-generation prompt tokenization is non-deterministic;
+                    # keep main's token-id grouping for every other GRPO user.
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config.grpo["num_generations_per_prompt"],
+                        )
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -3070,12 +3129,13 @@ def grpo_train(
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
+                    validation_step = total_steps + 1
                     val_metrics, validation_timings = validate(
                         policy_generation,
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
-                        step=total_steps + 1,
+                        step=validation_step,
                         master_config=master_config,
                         logger=logger,
                     )
@@ -3086,7 +3146,6 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
-
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -3423,7 +3482,6 @@ def grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
-
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
@@ -3497,6 +3555,23 @@ def validate(
             master_config.grpo["max_val_samples"]
             // master_config.grpo["val_batch_size"]
         )
+        validation_generation_config = master_config.grpo.get("validation_generation")
+        assert validation_generation_config is None or _should_use_nemo_gym(
+            master_config
+        ), (
+            "grpo.validation_generation is only supported on the NeMo-Gym rollout path."
+        )
+        validation_generation_overrides = master_config.policy["generation"]
+        if validation_generation_config is not None:
+            # Validation-only sampling overrides (e.g. temperature 0.0 for
+            # deterministic validation). Training rollouts keep policy.generation.
+            validation_generation_overrides = dict(validation_generation_overrides)
+            validation_generation_overrides["temperature"] = (
+                validation_generation_config["temperature"]
+            )
+            validation_generation_overrides["top_p"] = validation_generation_config[
+                "top_p"
+            ]
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
@@ -3506,7 +3581,7 @@ def validate(
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
-                generation_config = master_config.policy["generation"]
+                generation_config = validation_generation_overrides
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -3517,6 +3592,7 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    mark_validation_request=validation_generation_config is not None,
                     reward_penalty_config=master_config.reward_penalties,
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                 )
@@ -3877,14 +3953,6 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
     )
 
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
-
-    # Ensure collector knows initial weight version
-    trajectory_collector.set_weight_version.remote(weight_version)
-
-    print("📦 Started continuous background trajectory collection")
-
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
@@ -3913,6 +3981,17 @@ def async_grpo_train(
 
             traceback.print_exc()
             return
+
+    # Start trajectory collection only after generation holds real weights.
+    # The engines come up with load_format=dummy (weights arrive via the refit
+    # above); collecting before the refit fills the buffer with garbage
+    # rollouts sampled from randomly initialized weights.
+    collection_task = trajectory_collector.start_collection.remote(dataloader)  # noqa: F841
+
+    # Ensure collector knows initial weight version
+    trajectory_collector.set_weight_version.remote(weight_version)
+
+    print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -4323,8 +4402,17 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    # Positional grouping is only needed for agentic gym rollouts,
+                    # where per-generation prompt tokenization is non-deterministic;
+                    # keep main's token-id grouping for every other GRPO user.
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config.grpo["num_generations_per_prompt"],
+                        )
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -4433,6 +4521,17 @@ def async_grpo_train(
                     with timer.time("idle/validation"):
                         # Pause trajectory collection during validation to reduce memory pressure
                         trajectory_collector.pause.remote()
+                        # Also DRAIN in-flight rollouts before validating: pause only
+                        # stops new launches, and the ~hundreds of in-flight train
+                        # rollouts otherwise share the engines with the val burst,
+                        # pushing val agents into their timeout (val@14 measured
+                        # 0.78% and val@5 6.6% under contention vs 25-39% train-side
+                        # solve rates in the same windows). Draining keeps the run
+                        # fully async while making every val point measure the model
+                        # on idle engines.
+                        ray.get(
+                            trajectory_collector.wait_for_pending_generations.remote()
+                        )
 
                         if NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
@@ -4441,12 +4540,13 @@ def async_grpo_train(
                             POLICY_GENERATION_STALE = False
                         else:
                             policy_generation.prepare_for_generation()
+                        validation_step = step + 1
                         val_metrics, validation_timings = validate(
                             policy_generation,
                             val_dataloader,
                             tokenizer,
                             val_task_to_env,
-                            step=step + 1,
+                            step=validation_step,
                             master_config=master_config,
                             logger=logger,
                         )
@@ -4455,15 +4555,21 @@ def async_grpo_train(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    # Explicit GPU memory cleanup after validation in async mode
+                    import gc
 
-                        # Explicit GPU memory cleanup after validation in async mode
-                        import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-                        gc.collect()
-                        torch.cuda.empty_cache()
-
-                        # Resume trajectory collection after validation
-                        trajectory_collector.resume.remote()
+                    # Resume trajectory collection after validation. Without
+                    # this the collector's spawn loop waits forever on the
+                    # manual-pause event set at the val boundary: the run
+                    # trains exactly one more step off buffered trajectories
+                    # and then starves at 15/16 groups until walltime
+                    # (observed in grpo-tot-1 windows 1-2 when a merge
+                    # reconstruction left these lines unreachable behind the
+                    # target_reached return).
+                    trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4774,7 +4880,6 @@ def async_grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
-
             timer.reset()
             step += 1
             if should_save_by_timeout:
@@ -4801,7 +4906,6 @@ def async_grpo_train(
             checkpointer.shutdown()
         except Exception as e:
             print(f"Error finalizing pending checkpoint: {e}")
-
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:
