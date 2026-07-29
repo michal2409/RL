@@ -2620,6 +2620,79 @@ def test_periodic_validation_starts_at_configured_step(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_training_stops_at_validation_accuracy_threshold(
+    mock_grpo_components, train_func
+):
+    """Both trainers stop early once validation accuracy reaches the threshold."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "stop_at_validation_accuracy": 0.5,
+            "val_at_end": False,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        if train_func == async_grpo_train:
+            master_config.policy["generation"]["colocated"]["enabled"] = False
+            stack.enter_context(
+                mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=_mock_seq_logprob_error_result(),
+                )
+            )
+
+        mock_validate = stack.enter_context(
+            patch(
+                "nemo_rl.algorithms.grpo.validate",
+                return_value=({"accuracy": 0.75}, {}),
+            )
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    # Validation fires at step 2 with accuracy above the threshold, so
+    # training stops before the step-4 validation ever runs.
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == [2]
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_steps is reached"""
     # Set max steps to 12
