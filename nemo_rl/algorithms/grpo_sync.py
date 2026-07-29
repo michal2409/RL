@@ -445,6 +445,9 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     val_start_at = master_config.grpo.get("val_start_at", None)
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    stop_at_validation_accuracy = master_config.grpo.get(
+        "stop_at_validation_accuracy", None
+    )
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
@@ -525,6 +528,17 @@ def grpo_train_sync(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        if (
+            stop_at_validation_accuracy is not None
+            and val_metrics["accuracy"] >= stop_at_validation_accuracy
+        ):
+            print(
+                f"Initial validation accuracy reached the early-stop threshold "
+                f"({val_metrics['accuracy']:.4f} >= {stop_at_validation_accuracy}); "
+                "stopping training",
+                flush=True,
+            )
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -1025,6 +1039,17 @@ def grpo_train_sync(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    if (
+                        stop_at_validation_accuracy is not None
+                        and val_metrics["accuracy"] >= stop_at_validation_accuracy
+                    ):
+                        print(
+                            f"Validation accuracy reached the early-stop threshold "
+                            f"({val_metrics['accuracy']:.4f} >= "
+                            f"{stop_at_validation_accuracy}); stopping training",
+                            flush=True,
+                        )
+                        return
 
                 # advantages and token_mask are in scope from the
                 # advantage / masking blocks above. No need to re-fetch.

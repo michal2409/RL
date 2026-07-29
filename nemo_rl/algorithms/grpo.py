@@ -273,6 +273,9 @@ class GRPOConfig(TypedDict):
     # batches, disabling env-driven loss masking; absent/true carries the
     # flags and masks flagged samples from the loss.
     mask_env_flagged_samples: NotRequired[bool]
+    # Stop training as soon as a validation accuracy reaches this threshold;
+    # absent disables early stopping.
+    stop_at_validation_accuracy: NotRequired[float]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -2617,6 +2620,9 @@ def grpo_train(
     val_start_at = master_config.grpo.get("val_start_at", None)
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+    stop_at_validation_accuracy = master_config.grpo.get(
+        "stop_at_validation_accuracy", None
+    )
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2649,6 +2655,17 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        if (
+            stop_at_validation_accuracy is not None
+            and val_metrics["accuracy"] >= stop_at_validation_accuracy
+        ):
+            print(
+                f"Initial validation accuracy reached the early-stop threshold "
+                f"({val_metrics['accuracy']:.4f} >= {stop_at_validation_accuracy}); "
+                "stopping training",
+                flush=True,
+            )
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -3212,6 +3229,17 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    if (
+                        stop_at_validation_accuracy is not None
+                        and val_metrics["accuracy"] >= stop_at_validation_accuracy
+                    ):
+                        print(
+                            f"Validation accuracy reached the early-stop threshold "
+                            f"({val_metrics['accuracy']:.4f} >= "
+                            f"{stop_at_validation_accuracy}); stopping training",
+                            flush=True,
+                        )
+                        return
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3931,6 +3959,9 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    stop_at_validation_accuracy = master_config.grpo.get(
+        "stop_at_validation_accuracy", None
+    )
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -4112,6 +4143,7 @@ def async_grpo_train(
         # Pause trajectory collection during initial validation
         trajectory_collector.pause.remote()
 
+        initial_val_accuracy: Optional[float] = None
         try:
             val_metrics, validation_timings = validate(
                 policy_generation,
@@ -4122,6 +4154,7 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
+            initial_val_accuracy = val_metrics.get("accuracy")
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
@@ -4135,6 +4168,27 @@ def async_grpo_train(
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
+
+        if (
+            stop_at_validation_accuracy is not None
+            and initial_val_accuracy is not None
+            and initial_val_accuracy >= stop_at_validation_accuracy
+        ):
+            print(
+                f"Initial validation accuracy reached the early-stop threshold "
+                f"({initial_val_accuracy:.4f} >= {stop_at_validation_accuracy}); "
+                "stopping training",
+                flush=True,
+            )
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
+            return
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -4657,6 +4711,17 @@ def async_grpo_train(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        if (
+                            stop_at_validation_accuracy is not None
+                            and val_metrics["accuracy"] >= stop_at_validation_accuracy
+                        ):
+                            print(
+                                f"Validation accuracy reached the early-stop "
+                                f"threshold ({val_metrics['accuracy']:.4f} >= "
+                                f"{stop_at_validation_accuracy}); stopping training",
+                                flush=True,
+                            )
+                            return
 
                         # Explicit GPU memory cleanup after validation in async mode
                         import gc
