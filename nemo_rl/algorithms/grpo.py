@@ -18,7 +18,16 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    NotRequired,
+    Optional,
+    Protocol,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 import numpy as np
 import ray
@@ -237,6 +246,41 @@ _REWARD_PENALTY_FLAGS = (
     "penalize_unwanted_tokens",
     "penalize_malformed_think_tag",
 )
+
+
+class TrainTelemetryHooks(Protocol):
+    """Benchmark/telemetry hooks observed by the train loops.
+
+    Implementations are injected by launch stacks (e.g. benchmark compliance
+    logging); the train loops only call these when a logger is provided.
+    """
+
+    target_reached: bool
+
+    def start_train_block(self, step: int) -> None: ...
+
+    def observe_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: str = "",
+        step_finished: bool = False,
+    ) -> None: ...
+
+    def start_eval(self, step: int) -> None: ...
+
+    def end_eval(
+        self,
+        step: int,
+        val_metrics: Optional[dict[str, Any]],
+        validation_timings: Optional[dict[str, Any]],
+    ) -> None: ...
+
+    def end_eval_with_error(self, step: int) -> None: ...
+
+    def log_init_stop_run_start(self) -> None: ...
+
+    def finalize(self) -> None: ...
 
 
 class GRPOConfig(TypedDict):
@@ -2542,6 +2586,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    mlperf_logger: Optional[TrainTelemetryHooks] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer(context={"worker": "driver"})
@@ -2592,6 +2637,9 @@ def grpo_train(
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
+    if mlperf_logger is not None:
+        mlperf_logger.log_init_stop_run_start()
+
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
@@ -2608,18 +2656,31 @@ def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        val_metrics, validation_timings = validate(
-            policy_generation,
-            val_dataloader,
-            tokenizer,
-            val_task_to_env,
-            step=0,
-            master_config=master_config,
-            logger=logger,
-        )
+        if mlperf_logger is not None:
+            mlperf_logger.start_eval(0)
+        try:
+            val_metrics, validation_timings = validate(
+                policy_generation,
+                val_dataloader,
+                tokenizer,
+                val_task_to_env,
+                step=0,
+                master_config=master_config,
+                logger=logger,
+            )
+        except Exception:
+            if mlperf_logger is not None:
+                mlperf_logger.end_eval_with_error(0)
+            raise
+        if mlperf_logger is not None:
+            mlperf_logger.end_eval(0, val_metrics, validation_timings)
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        if mlperf_logger is not None and mlperf_logger.target_reached:
+            return
+    elif mlperf_logger is not None:
+        mlperf_logger.start_train_block(total_steps)
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -2815,6 +2876,10 @@ def grpo_train(
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+                    if mlperf_logger is not None:
+                        mlperf_logger.observe_metrics(
+                            rollout_metrics, total_steps + 1, prefix="train"
+                        )
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo["reward_scaling"]
@@ -3161,15 +3226,27 @@ def grpo_train(
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=total_steps + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
+                    validation_step = total_steps + 1
+                    if mlperf_logger is not None:
+                        mlperf_logger.start_eval(validation_step)
+                    try:
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=validation_step,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                    except Exception:
+                        if mlperf_logger is not None:
+                            mlperf_logger.end_eval_with_error(validation_step)
+                        raise
+                    if mlperf_logger is not None:
+                        mlperf_logger.end_eval(
+                            validation_step, val_metrics, validation_timings
+                        )
                     policy_generation.finish_generation()
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
@@ -3177,6 +3254,8 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    if mlperf_logger is not None and mlperf_logger.target_reached:
+                        return
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3504,6 +3583,8 @@ def grpo_train(
             if refit_metrics:
                 logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
@@ -3514,6 +3595,13 @@ def grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(
+                    timing_metrics,
+                    total_steps + 1,
+                    prefix="timing/train",
+                    step_finished=True,
+                )
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
@@ -3537,11 +3625,15 @@ def grpo_train(
             if should_save_by_timeout:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
+                if mlperf_logger is not None:
+                    mlperf_logger.finalize()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
+                if mlperf_logger is not None:
+                    mlperf_logger.finalize()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -3557,6 +3649,9 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+    if mlperf_logger is not None:
+        mlperf_logger.finalize()
 
 
 def validate(
@@ -3775,6 +3870,7 @@ def async_grpo_train(
     max_trajectory_age_steps: int = 1,
     teacher_worker_groups: Optional[dict[str, Any]] = None,
     alias_to_group_alias: Optional[dict[str, str]] = None,
+    mlperf_logger: Optional[TrainTelemetryHooks] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -3792,6 +3888,7 @@ def async_grpo_train(
         grpo_save_state: Training state
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
+        mlperf_logger: Optional benchmark/telemetry hooks (see TrainTelemetryHooks)
     """
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
@@ -3855,6 +3952,11 @@ def async_grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
+
+    if mlperf_logger is not None:
+        mlperf_logger.log_init_stop_run_start()
+        if not (val_at_start and step == 0):
+            mlperf_logger.start_train_block(step)
 
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
@@ -4013,6 +4115,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
             return
     else:
         print("🔄 Preparing policy generation for inference...")
@@ -4024,6 +4128,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
             return
 
     print("✅ Policy generation setup complete, proceeding to validation...")
@@ -4034,7 +4140,10 @@ def async_grpo_train(
         # Pause trajectory collection during initial validation
         trajectory_collector.pause.remote()
 
+        initial_validation_error: Optional[Exception] = None
         try:
+            if mlperf_logger is not None:
+                mlperf_logger.start_eval(0)
             val_metrics, validation_timings = validate(
                 policy_generation,
                 val_dataloader,
@@ -4044,19 +4153,44 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
+            if mlperf_logger is not None:
+                mlperf_logger.end_eval(0, val_metrics, validation_timings)
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             print("✅ Initial validation completed successfully")
         except Exception as e:
-            print(f"❌ Initial validation failed: {e}")
-            import traceback
+            if mlperf_logger is not None:
+                # end_eval_with_error emits the terminal RUN_STOP; continuing to
+                # train would append events after it and could never log SUCCESS,
+                # so fail fast instead of treating validation as optional. The
+                # raise happens below, after actor cleanup.
+                mlperf_logger.end_eval_with_error(0)
+                initial_validation_error = e
+            else:
+                print(f"❌ Initial validation failed: {e}")
+                import traceback
 
-            traceback.print_exc()
-            # Continue anyway since validation is optional
+                traceback.print_exc()
+                # Continue anyway since validation is optional
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
+
+        if mlperf_logger is not None and (
+            mlperf_logger.target_reached or initial_validation_error is not None
+        ):
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
+            if initial_validation_error is not None:
+                raise initial_validation_error
+            return
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -4563,20 +4697,34 @@ def async_grpo_train(
                             POLICY_GENERATION_STALE = False
                         else:
                             policy_generation.prepare_for_generation()
-                        val_metrics, validation_timings = validate(
-                            policy_generation,
-                            val_dataloader,
-                            tokenizer,
-                            val_task_to_env,
-                            step=step + 1,
-                            master_config=master_config,
-                            logger=logger,
-                        )
+                        validation_step = step + 1
+                        if mlperf_logger is not None:
+                            mlperf_logger.start_eval(validation_step)
+                        try:
+                            val_metrics, validation_timings = validate(
+                                policy_generation,
+                                val_dataloader,
+                                tokenizer,
+                                val_task_to_env,
+                                step=validation_step,
+                                master_config=master_config,
+                                logger=logger,
+                            )
+                        except Exception:
+                            if mlperf_logger is not None:
+                                mlperf_logger.end_eval_with_error(validation_step)
+                            raise
+                        if mlperf_logger is not None:
+                            mlperf_logger.end_eval(
+                                validation_step, val_metrics, validation_timings
+                            )
                         policy_generation.finish_generation()
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        if mlperf_logger is not None and mlperf_logger.target_reached:
+                            return
 
                         # Explicit GPU memory cleanup after validation in async mode
                         import gc
@@ -4901,6 +5049,8 @@ def async_grpo_train(
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(metrics, step + 1, prefix="train")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
                 timing_metrics,
@@ -4908,6 +5058,13 @@ def async_grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(
+                    timing_metrics,
+                    step + 1,
+                    prefix="timing/train",
+                    step_finished=True,
+                )
 
             timer.reset()
             step += 1
@@ -4935,6 +5092,8 @@ def async_grpo_train(
             checkpointer.shutdown()
         except Exception as e:
             print(f"Error finalizing pending checkpoint: {e}")
+        if mlperf_logger is not None:
+            mlperf_logger.finalize()
 
         # Clean up
         print("🛑 Stopping trajectory collection...")
