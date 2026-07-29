@@ -38,11 +38,14 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _stable_group_ids,
     _validate_use_kl_in_reward_compat,
+    add_grpo_token_loss_masks_and_generation_logprobs,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
+    extract_initial_prompt_messages,
     grpo_train,
     refit_policy_generation,
     setup,
@@ -158,6 +161,29 @@ def test_initial_policy_generation_stale() -> None:
 
     generation.weight_synchronizer.is_stale = True
     assert _initial_policy_generation_stale(generation, completed_steps=0)
+
+
+def test_stable_group_ids_uses_contiguous_prompt_groups():
+    rendered_prompt_ids = torch.tensor(
+        [
+            [10, 11],
+            [10, 12],
+            [20, 21],
+            [20, 22],
+        ]
+    )
+
+    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+
+    assert torch.equal(result, torch.tensor([[0], [0], [1], [1]]))
+
+
+def test_stable_group_ids_falls_back_for_incomplete_group():
+    rendered_prompt_ids = torch.tensor([[10], [11], [20]])
+
+    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+
+    assert result is rendered_prompt_ids
 
 
 @pytest.fixture
@@ -838,6 +864,13 @@ class StubAsyncTrajectoryCollector:
     @property
     def resume(self):
         """Resume collection - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def wait_for_pending_generations(self):
+        """Drain in-flight rollouts - returns a remote-callable mock"""
         mock = MagicMock()
         mock.remote = MagicMock(return_value=MagicMock())
         return mock
@@ -4077,3 +4110,138 @@ def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
 def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
     fields = _train_fields_for_step(skip_prev_logprobs)
     assert ("prev_logprobs" in fields) is expect_prev
+
+
+class TestMultiTurnPromptHelpers:
+    """Tests for GRPO multi-turn prompt extraction and loss masking."""
+
+    def test_prompt_extraction_with_multi_turn_history(self):
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+        ]
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([7, 8]),
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(message["token_ids"]) for message in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+
+        assert [message["role"] for message in result[0]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert generated_message not in result[0]
+
+    def test_prompt_extraction_with_system_message(self):
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "You are a math tutor.",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([4, 5]),
+            },
+        ]
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([6, 7]),
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(message["token_ids"]) for message in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+
+        assert [message["role"] for message in result[0]] == ["system", "user"]
+        assert generated_message not in result[0]
+
+    def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
+        message_log = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+            {
+                "role": "assistant",
+                "content": "6",
+                "token_ids": torch.tensor([7, 8]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[3]["token_loss_mask"], torch.tensor([1, 1]))
+
+    def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
+        message_log = [
+            {
+                "role": "assistant",
+                "content": "prompt history",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "next question",
+                "token_ids": torch.tensor([3, 4]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {
+                "role": "assistant",
+                "content": "generated response",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.5, 0.6]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(
+            message_log[0]["generation_logprobs"], torch.tensor([0.0, 0.0])
+        )
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
