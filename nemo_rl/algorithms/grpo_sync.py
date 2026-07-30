@@ -58,6 +58,7 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
+    _validation_stop_value,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -445,6 +446,8 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    stop_at_validation_accuracy = master_config.grpo["stop_at_validation_accuracy"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
@@ -525,6 +528,19 @@ def grpo_train_sync(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        if (
+            stop_at_validation_accuracy is not None
+            and _validation_stop_value(val_metrics, stop_at_validation_metric)
+            >= stop_at_validation_accuracy
+        ):
+            print(
+                f"Initial validation {stop_at_validation_metric} reached the "
+                f"early-stop threshold "
+                f"({_validation_stop_value(val_metrics, stop_at_validation_metric):.4f} "
+                f">= {stop_at_validation_accuracy}); stopping training",
+                flush=True,
+            )
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -1025,6 +1041,21 @@ def grpo_train_sync(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    if (
+                        stop_at_validation_accuracy is not None
+                        and _validation_stop_value(
+                            val_metrics, stop_at_validation_metric
+                        )
+                        >= stop_at_validation_accuracy
+                    ):
+                        print(
+                            f"Validation {stop_at_validation_metric} reached the "
+                            f"early-stop threshold "
+                            f"({_validation_stop_value(val_metrics, stop_at_validation_metric):.4f} "
+                            f">= {stop_at_validation_accuracy}); stopping training",
+                            flush=True,
+                        )
+                        return
 
                 # advantages and token_mask are in scope from the
                 # advantage / masking blocks above. No need to re-fetch.

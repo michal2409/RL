@@ -267,6 +267,12 @@ class GRPOConfig(TypedDict):
     # k > 1 additionally reports pass@k over each prompt's k rollouts as the
     # pass_k metric.
     val_num_generations_per_prompt: int
+    # Early stop: end training once the chosen validation metric reaches
+    # this threshold; null disables early stopping.
+    stop_at_validation_accuracy: float | None
+    # Which validation metric the early stop compares, e.g. accuracy (always
+    # reported) or pass_k (grouped validation).
+    stop_at_validation_metric: str
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -2552,6 +2558,15 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _validation_stop_value(val_metrics: dict[str, Any], stop_metric: str) -> float:
+    """Value of the early-stop metric chosen by grpo.stop_at_validation_metric."""
+    assert stop_metric in val_metrics, (
+        f"grpo.stop_at_validation_metric={stop_metric!r} is not a reported "
+        f"validation metric; available: {sorted(val_metrics)}"
+    )
+    return val_metrics[stop_metric]
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2612,6 +2627,8 @@ def grpo_train(
     val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+    stop_at_validation_accuracy = master_config.grpo["stop_at_validation_accuracy"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2644,6 +2661,19 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        if (
+            stop_at_validation_accuracy is not None
+            and _validation_stop_value(val_metrics, stop_at_validation_metric)
+            >= stop_at_validation_accuracy
+        ):
+            print(
+                f"Initial validation {stop_at_validation_metric} reached the "
+                f"early-stop threshold "
+                f"({_validation_stop_value(val_metrics, stop_at_validation_metric):.4f} "
+                f">= {stop_at_validation_accuracy}); stopping training",
+                flush=True,
+            )
+            return
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
@@ -3206,6 +3236,21 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    if (
+                        stop_at_validation_accuracy is not None
+                        and _validation_stop_value(
+                            val_metrics, stop_at_validation_metric
+                        )
+                        >= stop_at_validation_accuracy
+                    ):
+                        print(
+                            f"Validation {stop_at_validation_metric} reached the "
+                            f"early-stop threshold "
+                            f"({_validation_stop_value(val_metrics, stop_at_validation_metric):.4f} "
+                            f">= {stop_at_validation_accuracy}); stopping training",
+                            flush=True,
+                        )
+                        return
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3921,6 +3966,8 @@ def async_grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    stop_at_validation_accuracy = master_config.grpo["stop_at_validation_accuracy"]
+    stop_at_validation_metric = master_config.grpo["stop_at_validation_metric"]
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
@@ -4102,6 +4149,7 @@ def async_grpo_train(
         # Pause trajectory collection during initial validation
         trajectory_collector.pause.remote()
 
+        initial_val_metrics: Optional[dict[str, Any]] = None
         try:
             val_metrics, validation_timings = validate(
                 policy_generation,
@@ -4112,6 +4160,7 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
+            initial_val_metrics = val_metrics
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
@@ -4125,6 +4174,29 @@ def async_grpo_train(
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
+
+        if (
+            stop_at_validation_accuracy is not None
+            and initial_val_metrics is not None
+            and _validation_stop_value(initial_val_metrics, stop_at_validation_metric)
+            >= stop_at_validation_accuracy
+        ):
+            print(
+                f"Initial validation {stop_at_validation_metric} reached the "
+                f"early-stop threshold "
+                f"({_validation_stop_value(initial_val_metrics, stop_at_validation_metric):.4f} "
+                f">= {stop_at_validation_accuracy}); stopping training",
+                flush=True,
+            )
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
+            return
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -4647,6 +4719,21 @@ def async_grpo_train(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
                         logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        if (
+                            stop_at_validation_accuracy is not None
+                            and _validation_stop_value(
+                                val_metrics, stop_at_validation_metric
+                            )
+                            >= stop_at_validation_accuracy
+                        ):
+                            print(
+                                f"Validation {stop_at_validation_metric} reached "
+                                f"the early-stop threshold "
+                                f"({_validation_stop_value(val_metrics, stop_at_validation_metric):.4f} "
+                                f">= {stop_at_validation_accuracy}); stopping training",
+                                flush=True,
+                            )
+                            return
 
                         # Explicit GPU memory cleanup after validation in async mode
                         import gc
